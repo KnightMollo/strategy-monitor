@@ -1,0 +1,5 @@
+# .cache/ stores yfinance price data parquet files
+.cache/
+__pycache__/
+*.pyc
+.env
