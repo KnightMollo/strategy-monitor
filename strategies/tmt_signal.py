@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from ..lib.market_data import fetch_prices, compute_sma
+from lib.market_data import fetch_prices, compute_sma
 
 
 @dataclass

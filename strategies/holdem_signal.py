@@ -11,7 +11,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from ..lib.market_data import compute_rsi, compute_sma, fetch_multiple
+from lib.market_data import compute_rsi, compute_sma, fetch_multiple
 
 
 @dataclass
