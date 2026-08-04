@@ -28,7 +28,7 @@ st.caption("Live signals & strategy metrics — no personal trade data")
 # ─── Hold'em Signal ───────────────────────────────────────────────────────────
 st.header("Hold'em — 3x Leveraged Rotation")
 
-with st.expander("📖 Strategy Rules", expanded=False):
+with st.expander("📖 Strategy Rules & Decision Tree", expanded=False):
     st.markdown("""
 **Core Logic:** RSI(10)-based 3-phase state machine
 
@@ -42,6 +42,27 @@ with st.expander("📖 Strategy Rules", expanded=False):
 
 **Backtest (2022–2026):** 10.2x return, 85% CAGR, -58% max drawdown, 1.57 Sharpe
 """)
+    st.markdown("**Decision Tree:**")
+    st.code("""
+SPY vs MA100?
+├─ SPY > MA100 (Bull Market)
+│   ├─ Phase 0 (Normal): Hold TQQQ
+│   │   └─ RSI(TQQQ) > 79 OR RSI(UPRO) > 79?
+│   │       └─ YES → Enter Phase 1
+│   │
+│   ├─ Phase 1 (Hedge): Hold UVXY
+│   │   └─ RSI(TQQQ) < 75 AND RSI(UPRO) < 75? OR held ≥ 5 days?
+│   │       └─ YES → Enter Phase 2
+│   │
+│   └─ Phase 2 (Cooldown): Hold SGOV
+│       └─ TQQQ pullback ≥ 2% from peak AND TQQQ > MA20?
+│           └─ YES → Return to Phase 0
+│
+└─ SPY ≤ MA100 (Bear Market)
+    └─ RSI(SQQQ) > 79?
+        ├─ YES → Hold TLT
+        └─ NO  → Hold SQQQ
+    """, language=None)
 
 with st.spinner("Computing Hold'em signal..."):
     holdem = compute_holdem_signal()
@@ -81,7 +102,7 @@ st.divider()
 # ─── TMT RSI(2) Signal ────────────────────────────────────────────────────────
 st.header("TMT — RSI(2) Mean Reversion")
 
-with st.expander("📖 Strategy Rules", expanded=False):
+with st.expander("📖 Strategy Rules & Decision Tree", expanded=False):
     st.markdown("""
 **Core Logic:** Larry Connors RSI(2) oversold-bounce on leveraged ETF
 
@@ -95,6 +116,24 @@ with st.expander("📖 Strategy Rules", expanded=False):
 
 **Backtest (2018–2026):** +1,782% total, 52% annualized, 82 trades, 72% win rate
 """)
+    st.markdown("**Decision Tree:**")
+    st.code("""
+QQQ > 200SMA? (Trend filter)
+├─ NO → WAIT (no entries below long-term trend)
+│
+└─ YES
+    └─ Currently holding TQQQ?
+        ├─ NO
+        │   └─ QQQ RSI(2) < 15?
+        │       ├─ YES → BUY TQQQ
+        │       └─ NO  → WAIT (idle capital → sector DM rotation)
+        │
+        └─ YES (in trade)
+            ├─ QQQ RSI(2) > 80?       → SELL TQQQ
+            ├─ Held ≥ 10 days?         → SELL TQQQ (safety cap)
+            ├─ Day 7+ AND RSI(2) < 15? → HOLD (soft extension)
+            └─ Otherwise               → HOLD
+    """, language=None)
 
 with st.spinner("Computing TMT signal..."):
     tmt = compute_tmt_signal()
@@ -118,8 +157,17 @@ st.divider()
 st.header("📈 Strategy Backtests")
 st.caption("Simulated equity curves using historical data (no real trades)")
 
+# Date range picker (default: YTD)
+today = dt.date.today()
+ytd_start = dt.date(today.year, 1, 1)
+date_cols = st.columns([1, 1, 2])
+with date_cols[0]:
+    bt_start = st.date_input("Start Date", value=ytd_start, min_value=dt.date(2018, 1, 1), max_value=today)
+with date_cols[1]:
+    bt_end = st.date_input("End Date", value=today, min_value=dt.date(2018, 1, 1), max_value=today)
+
 @st.cache_data(ttl=3600)
-def run_holdem_backtest() -> pd.Series:
+def run_holdem_backtest(start: str, end: str) -> pd.Series:
     """Simple Hold'em backtest: TQQQ buy & hold when SPY > MA100, else cash."""
     from lib.market_data import fetch_multiple
     data = fetch_multiple(["SPY", "TQQQ", "SQQQ"], period="5y")
@@ -133,6 +181,15 @@ def run_holdem_backtest() -> pd.Series:
 
     # Align
     idx = spy.index.intersection(tqqq.index)
+    spy = spy.reindex(idx)
+    tqqq = tqqq.reindex(idx)
+    ma100 = ma100.reindex(idx)
+    if sqqq is not None:
+        sqqq = sqqq.reindex(idx)
+
+    # Filter to date range
+    mask = (idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))
+    idx = idx[mask]
     spy = spy.reindex(idx)
     tqqq = tqqq.reindex(idx)
     ma100 = ma100.reindex(idx)
@@ -158,7 +215,7 @@ def run_holdem_backtest() -> pd.Series:
 
 
 @st.cache_data(ttl=3600)
-def run_tmt_backtest() -> pd.Series:
+def run_tmt_backtest(start: str, end: str) -> pd.Series:
     """Simple RSI(2) backtest on QQQ/TQQQ."""
     from strategies.tmt_signal import compute_rsi2
     from lib.market_data import fetch_prices, compute_sma
@@ -173,6 +230,14 @@ def run_tmt_backtest() -> pd.Series:
     tqqq_c = tqqq["Close"].reindex(idx)
     rsi2 = compute_rsi2(qqq_c)
     sma200 = compute_sma(qqq_c, 200)
+
+    # Filter to date range
+    mask = (idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))
+    idx = idx[mask]
+    qqq_c = qqq_c.reindex(idx)
+    tqqq_c = tqqq_c.reindex(idx)
+    rsi2 = rsi2.reindex(idx)
+    sma200 = sma200.reindex(idx)
 
     nav = 100000.0
     in_trade = False
@@ -203,9 +268,12 @@ def run_tmt_backtest() -> pd.Series:
 
 bt_col1, bt_col2 = st.columns(2)
 
+bt_start_str = str(bt_start)
+bt_end_str = str(bt_end)
+
 with bt_col1:
     st.subheader("Hold'em (simplified)")
-    holdem_curve = run_holdem_backtest()
+    holdem_curve = run_holdem_backtest(bt_start_str, bt_end_str)
     if not holdem_curve.empty:
         st.line_chart(holdem_curve, use_container_width=True)
         m = compute_metrics(holdem_curve)
@@ -216,7 +284,7 @@ with bt_col1:
 
 with bt_col2:
     st.subheader("TMT RSI(2)")
-    tmt_curve = run_tmt_backtest()
+    tmt_curve = run_tmt_backtest(bt_start_str, bt_end_str)
     if not tmt_curve.empty:
         st.line_chart(tmt_curve, use_container_width=True)
         m = compute_metrics(tmt_curve)
