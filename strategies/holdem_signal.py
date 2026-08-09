@@ -53,17 +53,15 @@ class HoldemConfig:
 def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
     """Compute the current Hold'em signal using live market data.
 
-    Decision tree:
-    ┌─ SPY > MA100? (Bull market)
-    │  ├─ Phase 0: Hold TQQQ
-    │  │   └─ RSI(TQQQ|UPRO) > 79 → enter Phase 1 (UVXY)
-    │  ├─ Phase 1: Hold UVXY (max 5 days)
-    │  │   └─ RSI < 75 OR 5 days → enter Phase 2 (SGOV)
-    │  └─ Phase 2: Hold SGOV (cooldown)
-    │      └─ TQQQ pullback ≥2% AND close > MA20 → back to Phase 0
-    └─ SPY ≤ MA100 (Bear market)
-       ├─ RSI(SQQQ) > 79 → Hold TLT
-       └─ Otherwise → Hold SQQQ
+     Decision tree:
+     ┌─ SPY > MA100? (Bull market)
+     │  ├─ Phase 0: Hold TQQQ, with 50MA 2-day cash gate
+     │  ├─ Phase 1: Hold UVXY (max 5 days)
+     │  └─ Phase 2: Hold SGOV cooldown
+     └─ SPY ≤ MA100 (Bear market)
+         ├─ Rebound checks: RSI(TQQQ)/RSI(SPY)
+         ├─ Defense switch: SQQQ vs TLT by relative RSI
+         └─ Bear default: TQQQ
     """
     if config is None:
         config = HoldemConfig()
@@ -123,6 +121,11 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
     phase2_start_idx = -999
     uvxy_start_idx = -999
 
+    RSI_EXIT = config.rsi_exit
+    COOLDOWN_DAYS = config.cooldown_days
+    PULLBACK_PCT = config.pullback_pct
+    MAX_UVXY_DAYS = config.max_uvxy_days
+
     for k in range(len(common_idx)):
         if k > i:
             break
@@ -143,8 +146,8 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
         if phase == 1:
             tqqq_peak = max(tqqq_peak, tq) if np.isfinite(tqqq_peak) else tq
             days_in_uvxy = k - uvxy_start_idx
-            rsi_exit_triggered = np.isfinite(r_tqqq) and np.isfinite(r_upro) and r_tqqq < config.rsi_exit and r_upro < config.rsi_exit
-            max_days_triggered = days_in_uvxy >= config.max_uvxy_days
+            rsi_exit_triggered = np.isfinite(r_tqqq) and np.isfinite(r_upro) and r_tqqq < RSI_EXIT and r_upro < RSI_EXIT
+            max_days_triggered = days_in_uvxy >= MAX_UVXY_DAYS
             if rsi_exit_triggered or max_days_triggered:
                 phase = 2
                 phase2_start_idx = k
@@ -160,7 +163,7 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
             days_since = (common_idx[k] - last_cooldown_start_date).days
         else:
             days_since = float("inf")
-        can_enter_uvxy = days_since > config.cooldown_days
+        can_enter_uvxy = days_since > COOLDOWN_DAYS
 
         overbought = (np.isfinite(r_tqqq) and r_tqqq > config.rsi_overbought) or \
                      (np.isfinite(r_upro) and r_upro > config.rsi_overbought)
@@ -175,7 +178,7 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
             tqqq_peak = max(tqqq_peak, tq) if np.isfinite(tqqq_peak) else tq
             drawdown = tq / tqqq_peak - 1 if np.isfinite(tqqq_peak) and tqqq_peak > 0 else 0
             tq_ma20 = float(ma20_tqqq.iloc[k]) if pd.notna(ma20_tqqq.iloc[k]) else np.nan
-            if drawdown <= -config.pullback_pct and np.isfinite(tq_ma20) and tq > tq_ma20:
+            if drawdown <= -PULLBACK_PCT and np.isfinite(tq_ma20) and tq > tq_ma20:
                 phase = 0
                 phase2_start_idx = -999
 
@@ -193,31 +196,85 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
     signal_date = common_idx[i].strftime("%Y-%m-%d")
     is_bull = np.isfinite(spy_ma_val) and spy_val > spy_ma_val
 
+    tqqq_retrace = tqqq_peak * (1 - PULLBACK_PCT) if np.isfinite(tqqq_peak) else np.nan
+
     # Determine next hold
-    if not is_bull:
-        if np.isfinite(v_rsi_sqqq) and v_rsi_sqqq > config.rsi_overbought:
-            next_hold = "TLT"
-            condition = f"Bear: SQQQ RSI {v_rsi_sqqq:.1f} > {config.rsi_overbought} → rotate to TLT"
-        else:
-            next_hold = "SQQQ"
-            condition = f"Bear: SPY ({spy_val:.1f}) ≤ MA100 ({spy_ma_val:.1f}), SQQQ RSI {v_rsi_sqqq:.1f}"
-    elif phase == 1:
-        next_hold = "UVXY"
-        condition = f"Bull hedge UVXY: TQQQ RSI {v_rsi_tqqq:.1f}, UPRO RSI {v_rsi_upro:.1f}"
-    elif phase == 2:
+    if not np.isfinite(spy_ma_val):
         next_hold = config.safe_asset
-        condition = f"Cooldown SGOV: TQQQ RSI {v_rsi_tqqq:.1f}, waiting pullback ≥{config.pullback_pct*100:.0f}%"
+        condition = "MA100 data insufficient, holding SGOV."
+    elif is_bull:
+        if phase == 1:
+            next_hold = "UVXY"
+            days_held_so_far = i - uvxy_start_idx
+            days_left = max(0, MAX_UVXY_DAYS - days_held_so_far)
+            condition = (
+                f"Bull hedge UVXY: TQQQ RSI {v_rsi_tqqq:.1f}, UPRO RSI {v_rsi_upro:.1f}. "
+                f"Exit when both < {RSI_EXIT} or max {MAX_UVXY_DAYS}d cap "
+                f"({days_held_so_far}d held, {days_left}d remain)"
+            )
+        elif phase == 2:
+            next_hold = config.safe_asset
+            if cooldown_remaining > 0:
+                ma20_gate = f" AND TQQQ > MA20 ({tqqq_ma20_val:.2f})" if np.isfinite(tqqq_ma20_val) else ""
+                condition = f"UVXY lock until {uvxy_lock_until}. Hold {config.safe_asset} or early exit if TQQQ < {tqqq_retrace:.2f}{ma20_gate}"
+            else:
+                condition = f"Cooldown complete. Waiting for RSI > {config.rsi_overbought} to re-enter UVXY or TQQQ < {tqqq_retrace:.2f}"
+        else:
+            spy_ma50_val = float(ma50_spy.iloc[i]) if pd.notna(ma50_spy.iloc[i]) else np.nan
+            days_below_50 = 0
+            if np.isfinite(spy_ma50_val):
+                for lookback in range(min(5, i)):
+                    idx = i - lookback
+                    prev_spy = float(close["SPY"].iloc[idx])
+                    prev_ma50 = float(ma50_spy.iloc[idx]) if pd.notna(ma50_spy.iloc[idx]) else np.nan
+                    if np.isfinite(prev_ma50) and prev_spy < prev_ma50:
+                        days_below_50 += 1
+                    else:
+                        break
+
+            if np.isfinite(spy_ma50_val) and days_below_50 >= 2:
+                next_hold = config.safe_asset
+                condition = f"Bull cash (50MA gate): SPY below MA50 for {days_below_50}d ({spy_val:.2f} < {spy_ma50_val:.2f})"
+            elif np.isfinite(spy_ma50_val) and spy_val > spy_ma50_val:
+                next_hold = "TQQQ"
+                condition = f"Bull TQQQ: SPY {spy_val:.2f} > MA50 {spy_ma50_val:.2f} & MA100 {spy_ma_val:.2f}"
+            else:
+                next_hold = "TQQQ"
+                condition = f"Bull TQQQ: SPY near MA50 ({spy_val:.2f} vs {spy_ma50_val:.2f}), awaiting 2d confirm"
     else:
-        next_hold = "TQQQ"
-        condition = f"Bull: SPY ({spy_val:.1f}) > MA100 ({spy_ma_val:.1f}), TQQQ RSI {v_rsi_tqqq:.1f}"
+        if np.isfinite(v_rsi_tqqq) and v_rsi_tqqq < 30:
+            next_hold = "TQQQ"
+            condition = f"Bear rebound: TQQQ RSI {v_rsi_tqqq:.1f} < 30"
+        elif np.isfinite(v_rsi_spy) and v_rsi_spy < 31:
+            next_hold = "TQQQ"
+            condition = f"Bear rebound: SPY RSI {v_rsi_spy:.1f} < 31"
+        elif np.isfinite(tqqq_ma20_val) and tqqq_val < tqqq_ma20_val:
+            if np.isfinite(v_rsi_sqqq) and np.isfinite(v_rsi_tlt) and v_rsi_sqqq > v_rsi_tlt:
+                next_hold = "SQQQ"
+                condition = (
+                    f"Bear defense SQQQ: TQQQ {tqqq_val:.2f} < MA20 {tqqq_ma20_val:.2f}, "
+                    f"SQQQ RSI {v_rsi_sqqq:.1f} > TLT RSI {v_rsi_tlt:.1f}"
+                )
+            else:
+                next_hold = "TLT"
+                condition = (
+                    f"Bear defense TLT: TQQQ {tqqq_val:.2f} < MA20 {tqqq_ma20_val:.2f}, "
+                    f"TLT RSI {v_rsi_tlt:.1f} >= SQQQ RSI {v_rsi_sqqq:.1f}"
+                )
+        elif np.isfinite(v_rsi_sqqq) and v_rsi_sqqq < 31:
+            next_hold = "SQQQ"
+            condition = f"Bear continuation SQQQ: SQQQ RSI {v_rsi_sqqq:.1f} < 31"
+        else:
+            next_hold = "TQQQ"
+            condition = "Bear default TQQQ: No rebound or defense signal"
 
     # Cooldown remaining
     cooldown_remaining = 0
     uvxy_lock_until = ""
     if last_cooldown_start_date is not None and phase == 2:
         elapsed = (common_idx[i] - last_cooldown_start_date).days
-        cooldown_remaining = max(0, config.cooldown_days - elapsed)
-        lock_end = last_cooldown_start_date + pd.Timedelta(days=config.cooldown_days)
+        cooldown_remaining = max(0, COOLDOWN_DAYS - elapsed)
+        lock_end = last_cooldown_start_date + pd.Timedelta(days=COOLDOWN_DAYS)
         uvxy_lock_until = lock_end.strftime("%Y-%m-%d")
 
     return HoldemSignal(

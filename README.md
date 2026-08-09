@@ -1,27 +1,24 @@
 # Strategy Monitor
 
-公开策略信号仪表盘 — 展示策略逻辑和实时信号，不包含任何个人交易数据。
+公开策略监控仪表盘（Streamlit），是 Local Dashboard 的剥离版：
+保留策略信号、行情指标、回测与扫描，移除所有个人交易与账户价值数据。
 
-## 包含策略
+## 页面
 
-### Hold'em — 3x杠杆轮动
-- RSI(10) 3-phase state machine
-- Bull: TQQQ → UVXY hedge → SGOV cooldown
-- Bear: SQQQ / TLT rotation
+- Overview: Hold'em / TMT 信号卡 + RRG 市场健康 + 1Y 回测快照
+- Hold'em: 完整信号状态机与决策树
+- TMT: RSI(2) 主信号 + RRG Idle 轮动参考 + RRG 地图
+- GEX Filter: 38 标的 Gamma Exposure 扫描与 8 过滤条件
+- SPX BWB: 当日结构建议（仅指引，不跟踪持仓）
+- Report: 季度回测对比（Hold'em / TMT / SPY）
 
-### TMT — RSI(2) 均值回归
-- QQQ RSI(2) < 15 超卖 → 买入 TQQQ
-- RSI(2) > 80 → 卖出
-- 持仓上限 10 天
+## 明确剥离内容
 
-## 部署到 Render
+本项目不读取、不展示：
 
-1. Push this repo to GitHub
-2. On Render → New Web Service → Connect repo
-3. Settings:
-   - **Build Command:** `pip install -r requirements.txt`
-   - **Start Command:** `streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`
-   - **Environment:** Python 3.11+
+- 交易流水 CSV
+- 账户持仓与账户总资产
+- 任何个人 P/L 统计
 
 ## 本地运行
 
@@ -30,11 +27,15 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## Render 部署
+
+1. Push repo to GitHub
+2. Render -> New Web Service -> Connect repo
+3. Settings
+   - Build Command: `pip install -r requirements.txt`
+   - Start Command: `streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true`
+   - Python: 3.11+
+
 ## 安全说明
 
-此仓库**不包含**:
-- 个人交易记录 (trades CSV)
-- 账户持仓/市值数据
-- 密码或 API keys
-
-可安全分享给朋友查看策略逻辑和信号。
+可安全分享给朋友查看策略逻辑与公开行情信号，不包含个人账户与交易隐私数据。

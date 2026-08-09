@@ -87,6 +87,24 @@ def fetch_multiple(tickers: list[str], period: str = "2y", force_refresh: bool =
     return result
 
 
+def get_latest_price(ticker: str) -> Optional[float]:
+    """Get the most recent closing price for a ticker."""
+    df = fetch_prices(ticker)
+    if df.empty:
+        return None
+    return float(df["Close"].iloc[-1])
+
+
+def get_latest_prices(tickers: list[str]) -> Dict[str, float]:
+    """Get latest closing prices for multiple tickers."""
+    prices = {}
+    for t in tickers:
+        p = get_latest_price(t)
+        if p is not None:
+            prices[t] = p
+    return prices
+
+
 def compute_sma(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window=window, min_periods=window).mean()
 
