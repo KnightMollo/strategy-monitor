@@ -11,7 +11,6 @@ import streamlit as st
 
 from lib.gex import GEX_TICKERS, apply_filters, compute_gex
 from lib.market_data import compute_sma, fetch_multiple, fetch_prices
-from lib.metrics import compute_metrics
 from lib.rrg import (
     RRG_BASKET,
     RRG_BENCHMARK,
@@ -21,7 +20,7 @@ from lib.rrg import (
     compute_rrg,
     detect_signals,
     get_rrg_ranking,
-    resample_weekly,
+    resample_biweekly,
 )
 from strategies.holdem_signal import HoldemConfig, compute_holdem_signal
 from strategies.tmt_signal import compute_rsi2
@@ -91,97 +90,6 @@ def get_tmt_signal_snapshot() -> dict:
     }
 
 
-@st.cache_data(ttl=3600)
-def run_holdem_backtest(start: str, end: str) -> pd.Series:
-    data = fetch_multiple(["SPY", "TQQQ", "SQQQ"], period="5y")
-    if "SPY" not in data or "TQQQ" not in data:
-        return pd.Series(dtype=float)
-
-    spy = data["SPY"]["Close"]
-    tqqq = data["TQQQ"]["Close"]
-    sqqq = data["SQQQ"]["Close"] if "SQQQ" in data else None
-    ma100 = spy.rolling(100).mean()
-
-    idx = spy.index.intersection(tqqq.index)
-    spy = spy.reindex(idx)
-    tqqq = tqqq.reindex(idx)
-    ma100 = ma100.reindex(idx)
-    if sqqq is not None:
-        sqqq = sqqq.reindex(idx)
-
-    mask = (idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))
-    idx = idx[mask]
-    spy = spy.reindex(idx)
-    tqqq = tqqq.reindex(idx)
-    ma100 = ma100.reindex(idx)
-    if sqqq is not None:
-        sqqq = sqqq.reindex(idx)
-
-    nav = 100000.0
-    curve = []
-    for i in range(1, len(idx)):
-        if pd.isna(ma100.iloc[i]):
-            curve.append(nav)
-            continue
-        if spy.iloc[i - 1] > ma100.iloc[i - 1]:
-            ret = tqqq.iloc[i] / tqqq.iloc[i - 1] - 1
-        elif sqqq is not None:
-            ret = sqqq.iloc[i] / sqqq.iloc[i - 1] - 1
-        else:
-            ret = 0
-        nav *= (1 + ret)
-        curve.append(nav)
-
-    return pd.Series([100000.0] + curve, index=idx)
-
-
-@st.cache_data(ttl=3600)
-def run_tmt_backtest(start: str, end: str) -> pd.Series:
-    qqq = fetch_prices("QQQ", period="5y")
-    tqqq = fetch_prices("TQQQ", period="5y")
-    if qqq.empty or tqqq.empty:
-        return pd.Series(dtype=float)
-
-    idx = qqq.index.intersection(tqqq.index)
-    qqq_c = qqq["Close"].reindex(idx)
-    tqqq_c = tqqq["Close"].reindex(idx)
-    rsi2 = compute_rsi2(qqq_c)
-    sma200 = compute_sma(qqq_c, 200)
-
-    mask = (idx >= pd.Timestamp(start)) & (idx <= pd.Timestamp(end))
-    idx = idx[mask]
-    qqq_c = qqq_c.reindex(idx)
-    tqqq_c = tqqq_c.reindex(idx)
-    rsi2 = rsi2.reindex(idx)
-    sma200 = sma200.reindex(idx)
-
-    nav = 100000.0
-    in_trade = False
-    days_held = 0
-    curve = []
-
-    for i in range(1, len(idx)):
-        if pd.isna(sma200.iloc[i]) or pd.isna(rsi2.iloc[i]):
-            curve.append(nav)
-            continue
-
-        if in_trade:
-            ret = tqqq_c.iloc[i] / tqqq_c.iloc[i - 1] - 1
-            nav *= (1 + ret)
-            days_held += 1
-            if rsi2.iloc[i] > 80 or days_held >= 10:
-                in_trade = False
-                days_held = 0
-        else:
-            if rsi2.iloc[i] < 15 and qqq_c.iloc[i] > sma200.iloc[i]:
-                in_trade = True
-                days_held = 0
-
-        curve.append(nav)
-
-    return pd.Series([100000.0] + curve, index=idx)
-
-
 def render_rrg_map(expander_title: str, key_prefix: str) -> None:
     with st.expander(expander_title, expanded=False):
         c1, c2 = st.columns([1, 1])
@@ -201,13 +109,19 @@ def render_rrg_map(expander_title: str, key_prefix: str) -> None:
             st.info("RRG data unavailable now")
             return
 
-        weekly = resample_weekly(raw_data)
-        if RRG_BENCHMARK not in weekly:
+        biweekly = resample_biweekly(raw_data)
+        if RRG_BENCHMARK not in biweekly:
             st.info("RRG benchmark series unavailable")
             return
 
         tail_len = max(tail_weeks, 1)
-        rrg_df = compute_rrg(weekly, RRG_BENCHMARK, tail_length=tail_len)
+        rrg_df = compute_rrg(
+            biweekly,
+            RRG_BENCHMARK,
+            ratio_period=7,
+            momentum_period=7,
+            tail_length=tail_len,
+        )
         if rrg_df.empty:
             st.info("RRG has insufficient data for plotting")
             return
@@ -282,7 +196,7 @@ def render_rrg_map(expander_title: str, key_prefix: str) -> None:
 
 
 st.sidebar.title("Strategy Monitor")
-page = st.sidebar.radio("Navigation", ["Overview", "Hold'em", "TMT", "GEX Filter", "SPX BWB", "Report"])
+page = st.sidebar.radio("Navigation", ["Overview", "Hold'em", "TMT", "GEX Filter", "SPX BWB"])
 
 st.sidebar.markdown("---")
 if st.sidebar.button("Refresh Prices"):
@@ -327,8 +241,14 @@ if page == "Overview":
     st.markdown("**Sector Rotation (RRG Weekly)**")
     try:
         rrg_raw = fetch_multiple(list(set(RRG_BASKET + [RRG_BENCHMARK])), period="2y")
-        rrg_weekly = resample_weekly(rrg_raw)
-        rrg_df = compute_rrg(rrg_weekly, RRG_BENCHMARK, tail_length=2)
+        rrg_biweekly = resample_biweekly(rrg_raw)
+        rrg_df = compute_rrg(
+            rrg_biweekly,
+            RRG_BENCHMARK,
+            ratio_period=7,
+            momentum_period=7,
+            tail_length=2,
+        )
         ranking = get_rrg_ranking(rrg_df)
         if not ranking.empty:
             qc = ranking["quadrant"].value_counts()
@@ -341,33 +261,6 @@ if page == "Overview":
             st.caption(f"Top: {top['ticker']} ({top['label']}) | Bottom: {bottom['ticker']} ({bottom['label']})")
     except Exception as e:
         st.caption(f"RRG unavailable: {e}")
-
-    st.markdown("---")
-    st.subheader("Backtest Snapshot")
-    today = dt.date.today()
-    start = str(today - dt.timedelta(days=365))
-    end = str(today)
-
-    b1, b2 = st.columns(2)
-    with b1:
-        h_curve = run_holdem_backtest(start, end)
-        if not h_curve.empty:
-            st.line_chart(h_curve, use_container_width=True)
-            m = compute_metrics(h_curve)
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Ann. Return", f"{m['annualized_return']*100:.1f}%")
-            k2.metric("Max DD", f"{m['max_drawdown']*100:.1f}%")
-            k3.metric("Sharpe", f"{m['sharpe']:.2f}")
-
-    with b2:
-        t_curve = run_tmt_backtest(start, end)
-        if not t_curve.empty:
-            st.line_chart(t_curve, use_container_width=True)
-            m = compute_metrics(t_curve)
-            k1, k2, k3 = st.columns(3)
-            k1.metric("Ann. Return", f"{m['annualized_return']*100:.1f}%")
-            k2.metric("Max DD", f"{m['max_drawdown']*100:.1f}%")
-            k3.metric("Sharpe", f"{m['sharpe']:.2f}")
 
 elif page == "Hold'em":
     st.title("🃏 Hold'em Strategy")
@@ -397,32 +290,80 @@ elif page == "Hold'em":
             i3.markdown(f"- RSI TLT: {signal.rsi_tlt:.1f}")
 
         with st.expander("Decision Tree", expanded=True):
+            bull_overbought = signal.rsi_tqqq > 79 or signal.rsi_upro > 79
+            tqqq_below_ma20 = signal.tqqq_ma20 > 0 and signal.tqqq_price < signal.tqqq_ma20
+            sqqq_gt_tlt = signal.rsi_sqqq > signal.rsi_tlt
+            spy_above_ma50 = signal.spy_ma50 > 0 and signal.spy_price > signal.spy_ma50
+            is_cash_gate = signal.next_hold == "SGOV" and signal.is_bull and signal.phase == 0
+
+            st.markdown("**Live Path Check**")
+            if signal.is_bull:
+                st.markdown("- {} SPY > MA100".format("OK" if signal.is_bull else "NO"))
+                if is_cash_gate:
+                    st.markdown("- NO SPY < MA50 for 2+ days -> SGOV cash gate")
+                elif not spy_above_ma50:
+                    st.markdown("- WARN SPY < MA50 for 1 day -> await confirmation")
+                else:
+                    st.markdown("- OK SPY > MA50 -> TQQQ")
+                st.markdown(f"- {'OK' if signal.phase == 1 else 'NO'} Phase 1 UVXY hedge")
+                st.markdown(f"- {'OK' if signal.phase == 2 else 'NO'} Phase 2 SGOV cooldown")
+                st.markdown(f"- {'OK' if bull_overbought else 'NO'} RSI overbought trigger (>79)")
+            else:
+                st.markdown("- OK SPY <= MA100")
+                st.markdown(f"- {'OK' if signal.rsi_tqqq < 30 else 'NO'} TQQQ RSI < 30")
+                st.markdown(f"- {'OK' if signal.rsi_spy < 31 else 'NO'} SPY RSI < 31")
+                st.markdown(f"- {'OK' if tqqq_below_ma20 else 'NO'} TQQQ < MA20")
+                st.markdown(f"- {'OK' if sqqq_gt_tlt else 'NO'} SQQQ RSI > TLT RSI")
+
             tree_dot = f"""
 digraph HoldemTree {{
     rankdir=LR;
+    graph [bgcolor="white", pad="0.2", nodesep="0.35", ranksep="0.45"];
     node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#94a3b8", fontname="Arial", fontsize=10];
     edge [color="#64748b", fontname="Arial", fontsize=9];
 
     start [label="Start", fillcolor="#e2e8f0"];
-    bull [label="SPY > MA100?"];
-    overbought [label="RSI(TQQQ/UPRO) > 79?"];
-    uvxy [label="Hold UVXY (Phase1)"];
-    cooldown [label="Hold SGOV (Phase2)"];
-    gate [label="SPY < MA50 for 2d?"];
-    tqqq [label="Hold TQQQ"];
-    bear [label="Bear branch"];
-    sqqq [label="Hold SQQQ"];
-    tlt [label="Hold TLT"];
+    bull [label="SPY > MA100?", fillcolor="#dbeafe", color="#2563eb"];
+    p1 [label="Phase 1\\nHold UVXY\\nExit: RSI < 75 or 5d cap"];
+    p2 [label="Phase 2\\nHold SGOV\\nCooldown 10d\\nEarly exit: pullback 2% + TQQQ > MA20"];
+    overbought [label="Overbought?\\nTQQQ or UPRO RSI > 79"];
+    cooldown [label="Cooldown complete?"];
+    uvxy [label="Enter UVXY"];
+    gate [label="SPY < MA50\\n2 days?"];
+    tqqq [label="TQQQ (3x)"];
+    cash_gate [label="Cash (SGOV)\\n50MA gate"];
+    bear_rsi_tqqq [label="TQQQ RSI < 30?"];
+    bear_rsi_spy [label="SPY RSI < 31?"];
+    bear_ma20 [label="TQQQ < MA20?"];
+    sqqq_vs_tlt [label="SQQQ RSI > TLT RSI?"];
+    hold_sqqq [label="Hold SQQQ"];
+    hold_tlt [label="Hold TLT"];
+    sqqq_cont [label="SQQQ RSI < 31?"];
+    tqqq_bear [label="Bear default: TQQQ"];
 
     start -> bull;
-    bull -> overbought [label="Yes"];
-    bull -> bear [label="No"];
-    overbought -> uvxy [label="Yes"];
+    bull -> p1 [label="Yes, phase 1"];
+    bull -> bear_rsi_tqqq [label="No"];
+    p1 -> p2 [label="Exit"];
+    p1 -> p1 [label="Hold"];
+    p2 -> overbought [label="No"];
+    p2 -> p2 [label="Yes"];
+    overbought -> cooldown [label="Yes"];
     overbought -> gate [label="No"];
-    gate -> cooldown [label="Yes"];
-    gate -> tqqq [label="No"];
-    bear -> sqqq [label="SQQQ RSI > TLT RSI"];
-    bear -> tlt [label="otherwise"];
+    gate -> tqqq [label="No (<2d below)"];
+    gate -> cash_gate [label="Yes (2d+ below)"];
+    cooldown -> uvxy [label="Yes"];
+    cooldown -> p2 [label="No"];
+    bear_rsi_tqqq -> tqqq_bear [label="Yes"];
+    bear_rsi_tqqq -> bear_rsi_spy [label="No"];
+    bear_rsi_spy -> tqqq_bear [label="Yes"];
+    bear_rsi_spy -> bear_ma20 [label="No"];
+    bear_ma20 -> sqqq_vs_tlt [label="Yes"];
+    bear_ma20 -> sqqq_cont [label="No"];
+    sqqq_vs_tlt -> hold_sqqq [label="Yes"];
+    sqqq_vs_tlt -> hold_tlt [label="No"];
+    sqqq_cont -> hold_sqqq [label="Yes"];
+    sqqq_cont -> tqqq_bear [label="No"];
 }}
 """
             st.graphviz_chart(tree_dot, use_container_width=True)
@@ -446,12 +387,64 @@ elif page == "TMT":
             m4.metric("Idle Breadth", f"{tmt['breadth']}%")
 
             with st.expander("Decision Tree", expanded=True):
+                st.markdown("**Public signal path (position state is intentionally omitted)**")
                 st.markdown(
                     "- RSI(2) < 15 and QQQ > 200SMA -> BUY TQQQ\n"
                     "- RSI(2) > 80 -> EXIT TQQQ and rotate to Idle\n"
                     "- Otherwise -> Idle rotation (RRG breadth + breakout)"
                 )
                 st.caption(f"Idle hold: {tmt['dm_hold']} | {tmt['idle_reason']}")
+
+                qqq_r = tmt["qqq_rsi2"]
+                qqq_above = tmt["above_200"]
+                breadth_pct = tmt["breadth"]
+                breakout_ticker = tmt["breakout_ticker"]
+                breakout_label = breakout_ticker or "-"
+                buy_fill = "#bbf7d0" if tmt["next_hold"] == "TQQQ" else "#f8fafc"
+                sell_fill = "#fecaca" if qqq_r > 80 else "#f8fafc"
+                idle_fill = "#ddd6fe" if tmt["next_hold"] == "SGOV" else "#f8fafc"
+                sector_fill = "#bfdbfe" if tmt["next_hold"] not in ("SGOV", "SPY", "TQQQ") else "#f8fafc"
+                notrend_fill = "#bfdbfe" if not qqq_above and qqq_r < 15 else "#f8fafc"
+                tree_dot = f"""
+digraph TMTTree {{
+    rankdir=TB;
+    graph [bgcolor="white", pad="0.3", nodesep="0.5", ranksep="0.6"];
+    node [shape=box, style="rounded,filled", fillcolor="#f8fafc", color="#94a3b8", fontname="Arial", fontsize=11];
+    edge [color="#64748b", fontname="Arial", fontsize=10];
+
+    start [label="QQQ RSI(2) = {qqq_r:.1f}"];
+    oversold [label="RSI(2) < 15?"];
+    trend [label="QQQ > 200MA?\\n{'YES' if qqq_above else 'NO'}"];
+    overbought [label="RSI(2) > 80?"];
+    buy [label="BUY TQQQ\\n(soft 7d, cap 21d)", fillcolor="{buy_fill}"];
+    sell [label="EXIT TQQQ\\nreturn to idle", fillcolor="{sell_fill}"];
+    wait_notrend [label="WAIT\\n(no trend support)", fillcolor="{notrend_fill}"];
+
+    subgraph cluster_idle {{
+        label="RRG Idle (biweekly)\\nBreadth: {breadth_pct}%";
+        color="#94a3b8";
+        breadth_check [label="Breadth >= 40%?"];
+        breakout_check [label="Sector breakout?\\n(Improving -> Leading)"];
+        hold_sector [label="HOLD {breakout_label}\\n(breakout sector)", fillcolor="{sector_fill}"];
+        hold_sgov [label="HOLD SGOV\\n(risk-off)", fillcolor="{idle_fill}"];
+        hold_idle [label="HOLD {tmt['dm_hold']}\\n(no breakout)"];
+        breadth_check -> hold_sgov [label="No (<40%)"];
+        breadth_check -> breakout_check [label="Yes"];
+        breakout_check -> hold_sector [label="Yes"];
+        breakout_check -> hold_idle [label="No breakout"];
+    }}
+
+    start -> oversold;
+    start -> overbought;
+    oversold -> trend [label="Yes"];
+    oversold -> breadth_check [label="No (idle)"];
+    trend -> buy [label="Yes"];
+    trend -> wait_notrend [label="No"];
+    overbought -> sell [label="Yes"];
+    overbought -> breadth_check [label="No"];
+}}
+"""
+                st.graphviz_chart(tree_dot, use_container_width=True)
 
     except Exception as e:
         st.error(f"TMT signal failed: {e}")
@@ -610,69 +603,5 @@ elif page == "SPX BWB":
         st.success("Entry window is open under VIX filter")
     else:
         st.warning("No entry: wait for VIX to return to 13-28 band")
-
-elif page == "Report":
-    st.title("📄 Strategy Report")
-    st.caption("Backtest-only quarterly comparison (no private transaction data)")
-
-    today = dt.date.today()
-    current_year = today.year
-    current_q = (today.month - 1) // 3 + 1
-
-    def quarter_range(y: int, q: int) -> tuple[pd.Timestamp, pd.Timestamp]:
-        starts = {1: (1, 1), 2: (4, 1), 3: (7, 1), 4: (10, 1)}
-        ends = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
-        sm, sd = starts[q]
-        em, ed = ends[q]
-        return pd.Timestamp(y, sm, sd), pd.Timestamp(y, em, ed)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        sel_year = st.selectbox("Year", options=list(range(current_year, current_year - 3, -1)), index=0)
-    with c2:
-        sel_q = st.selectbox("Quarter", options=[1, 2, 3, 4], index=current_q - 1)
-
-    q_start, q_end = quarter_range(sel_year, sel_q)
-    st.caption(f"Period: {q_start.date()} -> {q_end.date()}")
-
-    if st.button("Generate", type="primary"):
-        h_curve = run_holdem_backtest(str(q_start.date()), str(q_end.date()))
-        t_curve = run_tmt_backtest(str(q_start.date()), str(q_end.date()))
-        spy = fetch_prices("SPY", period="5y")
-        b_curve = pd.Series(dtype=float)
-        if not spy.empty:
-            s = spy["Close"]
-            s = s[(s.index >= q_start) & (s.index <= q_end)]
-            if len(s) > 1:
-                b_curve = s / s.iloc[0] * 100000
-
-        fig = go.Figure()
-        if not h_curve.empty:
-            fig.add_trace(go.Scatter(x=h_curve.index, y=h_curve.values, name="Holdem", line=dict(width=2)))
-        if not t_curve.empty:
-            fig.add_trace(go.Scatter(x=t_curve.index, y=t_curve.values, name="TMT", line=dict(width=2)))
-        if not b_curve.empty:
-            fig.add_trace(go.Scatter(x=b_curve.index, y=b_curve.values, name="SPY", line=dict(width=2, dash="dash")))
-        fig.update_layout(height=430, margin=dict(t=20, b=30), yaxis_title="NAV")
-        st.plotly_chart(fig, use_container_width=True)
-
-        rows = []
-        for name, curve in [("Holdem", h_curve), ("TMT", t_curve), ("SPY", b_curve)]:
-            if curve.empty or len(curve) < 2:
-                continue
-            m = compute_metrics(curve)
-            rows.append(
-                {
-                    "Strategy": name,
-                    "Return": f"{m['total_return']*100:.2f}%",
-                    "Ann": f"{m['annualized_return']*100:.2f}%",
-                    "Vol": f"{m['annualized_volatility']*100:.2f}%",
-                    "MaxDD": f"{m['max_drawdown']*100:.2f}%",
-                    "Sharpe": f"{m['sharpe']:.2f}",
-                    "Calmar": f"{m['calmar']:.2f}",
-                }
-            )
-        if rows:
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.caption(f"Updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")

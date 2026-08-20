@@ -149,17 +149,27 @@ def detect_signals(rrg_df: pd.DataFrame) -> List[Dict]:
     return signals
 
 
-def resample_weekly(daily_closes: Dict[str, pd.DataFrame]) -> Dict[str, pd.Series]:
-    """Convert daily OHLCV data to weekly close series."""
+def _resample_close(daily_closes: Dict[str, pd.DataFrame], rule: str) -> Dict[str, pd.Series]:
+    """Convert daily OHLCV data to a fixed-frequency close series."""
     weekly = {}
     for ticker, df in daily_closes.items():
         if df.empty:
             continue
         close = df["Close"].squeeze() if isinstance(df["Close"], pd.DataFrame) else df["Close"]
-        w = close.resample("W-FRI").last().dropna()
+        w = close.resample(rule).last().dropna()
         if len(w) > 10:
             weekly[ticker] = w
     return weekly
+
+
+def resample_weekly(daily_closes: Dict[str, pd.DataFrame]) -> Dict[str, pd.Series]:
+    """Convert daily OHLCV data to weekly close series."""
+    return _resample_close(daily_closes, "W-FRI")
+
+
+def resample_biweekly(daily_closes: Dict[str, pd.DataFrame]) -> Dict[str, pd.Series]:
+    """Convert daily OHLCV data to the biweekly Friday closes used by TMT idle RRG."""
+    return _resample_close(daily_closes, "2W-FRI")
 
 
 def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = "SPY") -> Dict:

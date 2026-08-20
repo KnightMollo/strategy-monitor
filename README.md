@@ -1,16 +1,15 @@
 # Strategy Monitor
 
 公开策略监控仪表盘（Streamlit），是 Local Dashboard 的剥离版：
-保留策略信号、行情指标、回测与扫描，移除所有个人交易与账户价值数据。
+保留策略信号、行情指标与扫描，移除所有回测、个人交易与账户价值数据。
 
 ## 页面
 
-- Overview: Hold'em / TMT 信号卡 + RRG 市场健康 + 1Y 回测快照
+- Overview: Hold'em / TMT 信号卡 + RRG 市场健康
 - Hold'em: 完整信号状态机与决策树
 - TMT: RSI(2) 主信号 + RRG Idle 轮动参考 + RRG 地图
 - GEX Filter: 38 标的 Gamma Exposure 扫描与 8 过滤条件
 - SPX BWB: 当日结构建议（仅指引，不跟踪持仓）
-- Report: 季度回测对比（Hold'em / TMT / SPY）
 
 ## 明确剥离内容
 
