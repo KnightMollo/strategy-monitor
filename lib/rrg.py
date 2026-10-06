@@ -150,13 +150,18 @@ def detect_signals(rrg_df: pd.DataFrame) -> List[Dict]:
 
 
 def _resample_close(daily_closes: Dict[str, pd.DataFrame], rule: str) -> Dict[str, pd.Series]:
-    """Convert daily OHLCV data to a fixed-frequency close series."""
+    """Convert daily OHLCV data to completed fixed-frequency close series."""
     weekly = {}
     for ticker, df in daily_closes.items():
         if df.empty:
             continue
         close = df["Close"].squeeze() if isinstance(df["Close"], pd.DataFrame) else df["Close"]
         w = close.resample(rule).last().dropna()
+        # Resampling labels a partially formed bucket with its future period-end
+        # date. Exclude that bucket so biweekly RRG only advances after Friday's
+        # close, matching the TMT idle calculation in Local Dashboard.
+        latest_source_date = pd.Timestamp(close.index.max()).normalize()
+        w = w[w.index <= latest_source_date]
         if len(w) > 10:
             weekly[ticker] = w
     return weekly
@@ -184,7 +189,11 @@ def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = 
     if benchmark not in close:
         return {"hold": "SGOV", "breadth": 0, "breakout_ticker": None, "quadrants": {}, "reason": "Benchmark data unavailable"}
 
-    spy_bw = close[benchmark].resample("2W-FRI").last().dropna()
+    biweekly = resample_biweekly(daily_closes)
+    if benchmark not in biweekly:
+        return {"hold": "SGOV", "breadth": 0, "breakout_ticker": None, "quadrants": {}, "reason": "Insufficient benchmark data"}
+
+    spy_bw = biweekly[benchmark]
     sector_rr = {}
     sector_rm = {}
     period = 7
@@ -192,7 +201,9 @@ def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = 
     for t in SECTOR_SPDR:
         if t not in close:
             continue
-        tw = close[t].resample("2W-FRI").last().dropna()
+        if t not in biweekly:
+            continue
+        tw = biweekly[t]
         cw = tw.index.intersection(spy_bw.index)
         if len(cw) <= period * 2 + 5:
             continue
