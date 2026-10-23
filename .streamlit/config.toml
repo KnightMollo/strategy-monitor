@@ -1,8 +1,32 @@
+# Artificial-Analysis-style theme; keep identical to Local Dashboard/.streamlit/config.toml [theme].
 [theme]
-primaryColor = "#4CAF50"
-backgroundColor = "#0E1117"
-secondaryBackgroundColor = "#262730"
-textColor = "#FAFAFA"
+base = "light"
+primaryColor = "#741A66"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F2F2"
+textColor = "#000000"
+linkColor = "#741A66"
+linkUnderline = false
+borderColor = "#D9D9D9"
+dataframeBorderColor = "#E5E5E5"
+dataframeHeaderBackgroundColor = "#F7F7F7"
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "8px"
+buttonRadius = "8px"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Newsreader:https://fonts.googleapis.com/css2?family=Newsreader:wght@400;500&display=swap"
+headingFontSizes = ["3.25rem", "2rem", "1.6rem", "1.25rem", "1.05rem", "0.9rem"]
+headingFontWeights = [400, 400, 400, 500, 500, 500]
+greenColor = "#1E9E5A"
+redColor = "#D43C3C"
+blueColor = "#2B44D6"
+violetColor = "#741A66"
+chartCategoricalColors = ["#741A66", "#2B44D6", "#EE7A35", "#4C9F59", "#C27A5D", "#000000", "#7C4DFF", "#3D8BF0", "#F2D64B", "#949494"]
+
+[theme.sidebar]
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F2F2"
 
 [server]
 headless = true

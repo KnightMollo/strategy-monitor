@@ -9,6 +9,18 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+from lib.aa_theme import (
+    STRATEGY_COLORS,
+    SERIES,
+    apply_theme,
+    banner,
+    card,
+    chart,
+    holding_tone,
+    kpis,
+    page_header,
+    rows,
+)
 from lib.gex import GEX_TICKERS, apply_filters, compute_gex
 from lib.market_data import compute_sma, fetch_multiple, fetch_prices
 from lib.rrg import (
@@ -17,18 +29,22 @@ from lib.rrg import (
     SECTOR_MAP,
     SECTOR_SPDR,
     compute_idle_signal,
+    compute_idle_rrg,
     compute_rrg,
     detect_signals,
     get_rrg_ranking,
     resample_biweekly,
 )
 from strategies.holdem_signal import HoldemConfig, compute_holdem_signal
-from strategies.tmt_signal import compute_rsi2
+from strategies.tmt_signal import IDLE_STATE_PATH, compute_tmt_snapshot
+from lib.tmt_rules import HISTORY_START
+from lib.tmt_views import render_tmt_action, render_tmt_idle_evaluation
 
 
 BASE_DIR = Path(__file__).resolve().parent
 
 st.set_page_config(page_title="Strategy Monitor", page_icon="📊", layout="wide", initial_sidebar_state="expanded")
+apply_theme("Strategy Monitor")
 
 
 def next_trading_day() -> str:
@@ -39,55 +55,22 @@ def next_trading_day() -> str:
 
 
 def get_tmt_signal_snapshot() -> dict:
-    """RSI(2) priority signal + idle RRG fallback, without position dependence."""
-    qqq = fetch_prices("QQQ", period="2y")
-    tqqq = fetch_prices("TQQQ", period="1y")
-    if qqq.empty or tqqq.empty or len(qqq) < 220:
-        return {"ready": False, "reason": "Insufficient QQQ/TQQQ data"}
+    """Frozen public snapshot, without personal position data."""
+    return compute_tmt_snapshot()
 
-    qqq_close = qqq["Close"]
-    rsi2 = compute_rsi2(qqq_close)
-    sma200 = compute_sma(qqq_close, 200)
 
-    curr_rsi = float(rsi2.iloc[-1])
-    curr_qqq = float(qqq_close.iloc[-1])
-    curr_tqqq = float(tqqq["Close"].iloc[-1])
-    curr_sma200 = float(sma200.iloc[-1]) if not pd.isna(sma200.iloc[-1]) else np.nan
-    above_200 = bool(np.isfinite(curr_sma200) and curr_qqq > curr_sma200)
-
-    idle_data = fetch_multiple(list(set(SECTOR_SPDR + ["SPY", "SGOV"])), period="2y")
-    idle_sig = compute_idle_signal(idle_data, benchmark="SPY")
-    idle_hold = idle_sig.get("hold", "SGOV")
-
-    if curr_rsi < 15 and above_200:
-        action = "BUY TQQQ"
-        next_hold = "TQQQ"
-        reason = f"RSI(2)={curr_rsi:.1f} < 15 and QQQ > 200SMA"
-    elif curr_rsi > 80:
-        action = "EXIT TQQQ"
-        next_hold = idle_hold
-        reason = f"RSI(2)={curr_rsi:.1f} > 80, rotate to idle"
-    else:
-        action = "WAIT"
-        next_hold = idle_hold
-        reason = f"RSI(2)={curr_rsi:.1f}, no trigger; idle -> {idle_hold}"
-
-    return {
-        "ready": True,
-        "action": action,
-        "next_hold": next_hold,
-        "reason": reason,
-        "qqq_rsi2": round(curr_rsi, 1),
-        "qqq_price": round(curr_qqq, 2),
-        "tqqq_price": round(curr_tqqq, 2),
-        "qqq_sma200": round(curr_sma200, 2) if np.isfinite(curr_sma200) else 0.0,
-        "above_200": above_200,
-        "next_date": next_trading_day(),
-        "dm_hold": idle_hold,
-        "breadth": round(idle_sig.get("breadth", 0.0) * 100),
-        "breakout_ticker": idle_sig.get("breakout_ticker"),
-        "idle_reason": idle_sig.get("reason", ""),
-    }
+def holdem_state_label(signal) -> str:
+    if not signal.is_bull:
+        return "Bear regime"
+    if signal.phase == 1:
+        return "UVXY hedge"
+    if signal.phase == 2:
+        return "SGOV cooldown"
+    if signal.chop_override:
+        return "Chop mode"
+    if signal.next_hold == "SGOV":
+        return "Cash gate"
+    return "Bull trend"
 
 
 def render_rrg_map(expander_title: str, key_prefix: str) -> None:
@@ -104,24 +87,13 @@ def render_rrg_map(expander_title: str, key_prefix: str) -> None:
         with c2:
             show_filter = st.selectbox("Show", ["All", "Top 10", "Bottom 10"], index=0, key=f"{key_prefix}_show")
 
-        raw_data = fetch_multiple(list(set(RRG_BASKET + [RRG_BENCHMARK])), period="2y")
+        raw_data = fetch_multiple(list(set(RRG_BASKET + [RRG_BENCHMARK])), start=HISTORY_START)
         if not raw_data or RRG_BENCHMARK not in raw_data:
             st.info("RRG data unavailable now")
             return
 
-        biweekly = resample_biweekly(raw_data)
-        if RRG_BENCHMARK not in biweekly:
-            st.info("RRG benchmark series unavailable")
-            return
-
         tail_len = max(tail_weeks, 1)
-        rrg_df = compute_rrg(
-            biweekly,
-            RRG_BENCHMARK,
-            ratio_period=7,
-            momentum_period=7,
-            tail_length=tail_len,
-        )
+        rrg_df = compute_idle_rrg(raw_data, RRG_BENCHMARK, tail_length=tail_len)
         if rrg_df.empty:
             st.info("RRG has insufficient data for plotting")
             return
@@ -136,10 +108,10 @@ def render_rrg_map(expander_title: str, key_prefix: str) -> None:
 
         plot_df = rrg_df[rrg_df["ticker"].isin(show_tickers)].copy()
         quadrant_colors = {
-            "Leading": "#16a34a",
-            "Improving": "#2563eb",
-            "Weakening": "#eab308",
-            "Lagging": "#dc2626",
+            "Leading": SERIES["green"],
+            "Improving": SERIES["blue"],
+            "Weakening": SERIES["yellow"],
+            "Lagging": "#D43C3C",
         }
 
         fig = go.Figure()
@@ -176,30 +148,27 @@ def render_rrg_map(expander_title: str, key_prefix: str) -> None:
                 )
             )
 
-        fig.update_layout(height=500, margin=dict(t=20, b=20, l=30, r=30), xaxis_title="RS-Ratio", yaxis_title="RS-Momentum", showlegend=False)
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(margin=dict(t=20, b=20, l=30, r=30), xaxis_title="RS-Ratio", yaxis_title="RS-Momentum", showlegend=False)
+        chart(fig, height=500)
 
         st.dataframe(
             ranking[["rank", "ticker", "label", "rs_ratio", "rs_momentum", "quadrant"]].style.format(
                 {"rs_ratio": "{:.2f}", "rs_momentum": "{:.2f}"}
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
             height=300,
         )
 
         signals = detect_signals(rrg_df)
         if signals:
-            sig_icons = {"BREAKOUT": "🚀", "RECOVER": "🔄", "FADING": "📉", "BREAKDOWN": "⬇", "ROTATION": "🔀"}
             for sig in signals[:5]:
-                st.caption(f"{sig_icons.get(sig['signal'], '•')} {sig['signal']}: {sig['ticker']} {sig['transition']}")
+                st.caption(f"{sig['signal']}: {sig['ticker']} {sig['transition']}")
 
 
-st.sidebar.title("Strategy Monitor")
-page = st.sidebar.radio("Navigation", ["Overview", "Hold'em", "TMT", "GEX Filter", "SPX BWB"])
+page = st.sidebar.radio("Navigation", ["Overview", "Hold'em", "TMT", "GEX Filter", "SPX BWB"], label_visibility="collapsed")
 
-st.sidebar.markdown("---")
-if st.sidebar.button("Refresh Prices"):
+if st.sidebar.button("Refresh prices", icon=":material/refresh:", width="stretch"):
     st.cache_data.clear()
     cache_dir = BASE_DIR / ".cache"
     if cache_dir.exists():
@@ -209,92 +178,103 @@ if st.sidebar.button("Refresh Prices"):
 
 
 if page == "Overview":
-    st.title("📊 Strategy Monitor")
-    st.caption(f"Last updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} | Public mode (no personal data)")
-
+    page_header("Overview", "Public strategy signals · no personal positions", f"Updated {dt.datetime.now():%Y-%m-%d %H:%M}")
+    st.subheader("Next session")
     c1, c2 = st.columns(2)
 
-    with c1:
-        st.subheader("Hold'em Signal")
+    with c1, card("Hold'em", STRATEGY_COLORS["Hold'em"], "SPY regime state machine · chop mode"):
         try:
             sig = compute_holdem_signal(HoldemConfig())
-            st.metric("Next Hold", sig.next_hold)
-            st.caption(sig.key_condition)
-            st.caption(f"Phase {sig.phase} | Regime: {'Bull' if sig.is_bull else 'Bear'}")
+            banner(f"Hold {sig.next_hold}", sig.key_condition, tone=holding_tone(sig.next_hold), label=holdem_state_label(sig))
+            rows([
+                ("Signal date", sig.signal_date),
+                ("Regime", "Bull" if sig.is_bull else "Bear"),
+                ("Chop mode", f"{'ON' if sig.chop_on else 'OFF'} · QQQ vol20 {sig.qqq_vol20:.1%}"),
+                ("RSI(2) leg", "Active" if sig.rsi2_leg else "Inactive"),
+            ])
         except Exception as e:
             st.warning(f"Hold'em unavailable: {e}")
 
-    with c2:
-        st.subheader("TMT Signal")
+    with c2, card("TMT", STRATEGY_COLORS["TMT"], "RSI(2) dip-buy · fixed biweekly idle rotation"):
         try:
             tmt = get_tmt_signal_snapshot()
             if tmt["ready"]:
-                st.metric("Next Hold", tmt["next_hold"])
-                st.caption(f"{tmt['next_date']} -> {tmt['action']}")
-                st.caption(tmt["reason"])
+                render_tmt_action(tmt)
             else:
                 st.warning(tmt["reason"])
+            render_tmt_idle_evaluation(tmt)
         except Exception as e:
             st.warning(f"TMT unavailable: {e}")
 
-    st.markdown("---")
-    st.markdown("**Sector Rotation (RRG Weekly)**")
+    st.subheader("Sector rotation")
     try:
-        rrg_raw = fetch_multiple(list(set(RRG_BASKET + [RRG_BENCHMARK])), period="2y")
-        rrg_biweekly = resample_biweekly(rrg_raw)
-        rrg_df = compute_rrg(
-            rrg_biweekly,
-            RRG_BENCHMARK,
-            ratio_period=7,
-            momentum_period=7,
-            tail_length=2,
-        )
+        rrg_raw = fetch_multiple(list(set(RRG_BASKET + [RRG_BENCHMARK])), start=HISTORY_START)
+        rrg_df = compute_idle_rrg(rrg_raw, RRG_BENCHMARK, tail_length=2)
         ranking = get_rrg_ranking(rrg_df)
         if not ranking.empty:
             qc = ranking["quadrant"].value_counts()
-            st.caption(
-                f"Leading {qc.get('Leading', 0)} | Improving {qc.get('Improving', 0)} | "
-                f"Weakening {qc.get('Weakening', 0)} | Lagging {qc.get('Lagging', 0)}"
-            )
             top = ranking.iloc[0]
             bottom = ranking.iloc[-1]
-            st.caption(f"Top: {top['ticker']} ({top['label']}) | Bottom: {bottom['ticker']} ({bottom['label']})")
+            kpis([
+                {"label": "Leading", "value": str(qc.get("Leading", 0))},
+                {"label": "Improving", "value": str(qc.get("Improving", 0))},
+                {"label": "Weakening", "value": str(qc.get("Weakening", 0))},
+                {"label": "Lagging", "value": str(qc.get("Lagging", 0))},
+                {"label": "Top / bottom", "value": f"{top['ticker']} / {bottom['ticker']}", "sub": f"{top['label']} / {bottom['label']}"},
+            ])
+            st.caption("Completed fixed biweekly RRG vs SPY")
     except Exception as e:
         st.caption(f"RRG unavailable: {e}")
 
 elif page == "Hold'em":
-    st.title("🃏 Hold'em Strategy")
+    page_header("Hold'em", "SPY regime state machine · TQQQ / UVXY / SGOV rotation")
     try:
         signal = compute_holdem_signal(HoldemConfig())
-        phase_labels = {0: "Phase 0 (Normal)", 1: "Phase 1 (UVXY Hedge)", 2: "Phase 2 (SGOV Cooldown)"}
+        state = holdem_state_label(signal)
+        color = STRATEGY_COLORS["Hold'em"]
+        left, right = st.columns([3, 2], gap="medium")
+        with left, card("Next session", color, f"Signal from {signal.signal_date} close · executes at next open"):
+            banner(f"Hold {signal.next_hold}", signal.key_condition, tone=holding_tone(signal.next_hold), label=state)
+            facts = [
+                ("Regime", f"{'Bull' if signal.is_bull else 'Bear'} · SPY {signal.spy_price:,.2f} vs MA100 {signal.spy_ma100:,.2f}"),
+                ("Cash gate", f"SPY {signal.spy_price:,.2f} vs MA50 {signal.spy_ma50:,.2f}"),
+                ("Phase", f"{signal.phase} · {state}"),
+            ]
+            if signal.phase == 2:
+                facts.append(("Cooldown", f"{signal.cooldown_remaining} days left"))
+            if signal.uvxy_lock_until:
+                facts.append(("UVXY lock until", signal.uvxy_lock_until))
+            facts.append(("Chop mode", f"{'ON' if signal.chop_on else 'OFF'} · QQQ vol20 {signal.qqq_vol20:.1%} (on >25%, off <20%)"))
+            facts.append(("RSI(2) leg", f"{'Active' if signal.rsi2_leg else 'Inactive'} · QQQ RSI2 {signal.qqq_rsi2:.1f}"))
+            rows(facts)
+        with right, card("Indicators", color, "Daily close values driving the state machine"):
+            kpis(
+                [
+                    {"label": "TQQQ RSI(10)", "value": f"{signal.rsi_tqqq:.1f}", "sub": "Hedge > 79"},
+                    {"label": "UPRO RSI(10)", "value": f"{signal.rsi_upro:.1f}", "sub": "Hedge > 79"},
+                    {"label": "QQQ vol20", "value": f"{signal.qqq_vol20:.1%}", "sub": "Chop > 25% · off < 20%"},
+                    {"label": "QQQ RSI(2)", "value": f"{signal.qqq_rsi2:.1f}", "sub": "Leg entry < 15"},
+                    {"label": "TQQQ", "value": f"${signal.tqqq_price:,.2f}", "sub": f"MA20 ${signal.tqqq_ma20:,.2f}"},
+                    {"label": "SPY RSI(10)", "value": f"{signal.rsi_spy:.1f}", "sub": "Bear rebound < 31"},
+                ],
+                columns=2,
+                flat=True,
+                compact=True,
+            )
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Signal Date", signal.signal_date)
-        col1.metric("Next Hold", signal.next_hold)
-        col2.metric("Phase", phase_labels.get(signal.phase, "Unknown"))
-        col2.metric("Market Regime", "Bull" if signal.is_bull else "Bear")
-        col3.metric("SPY", f"{signal.spy_price:.2f}")
-        col3.metric("TQQQ", f"{signal.tqqq_price:.2f}")
+        with st.expander("Indicator details"):
+            rows([
+                ("SPY MA100 / MA50", f"{signal.spy_ma100:.2f} / {signal.spy_ma50:.2f}"),
+                ("TQQQ MA20", f"{signal.tqqq_ma20:.2f}"),
+                ("RSI SQQQ / TLT", f"{signal.rsi_sqqq:.1f} / {signal.rsi_tlt:.1f}"),
+            ])
 
-        st.info(signal.key_condition)
-
-        with st.expander("Indicator Details", expanded=True):
-            i1, i2, i3 = st.columns(3)
-            i1.markdown(f"- SPY MA100: {signal.spy_ma100:.2f}")
-            i1.markdown(f"- SPY MA50: {signal.spy_ma50:.2f}")
-            i1.markdown(f"- TQQQ MA20: {signal.tqqq_ma20:.2f}")
-            i2.markdown(f"- RSI TQQQ: {signal.rsi_tqqq:.1f}")
-            i2.markdown(f"- RSI UPRO: {signal.rsi_upro:.1f}")
-            i2.markdown(f"- RSI SPY: {signal.rsi_spy:.1f}")
-            i3.markdown(f"- RSI SQQQ: {signal.rsi_sqqq:.1f}")
-            i3.markdown(f"- RSI TLT: {signal.rsi_tlt:.1f}")
-
-        with st.expander("Decision Tree", expanded=True):
+        with st.expander("Decision path", expanded=False):
             bull_overbought = signal.rsi_tqqq > 79 or signal.rsi_upro > 79
             tqqq_below_ma20 = signal.tqqq_ma20 > 0 and signal.tqqq_price < signal.tqqq_ma20
             sqqq_gt_tlt = signal.rsi_sqqq > signal.rsi_tlt
             spy_above_ma50 = signal.spy_ma50 > 0 and signal.spy_price > signal.spy_ma50
-            is_cash_gate = signal.next_hold == "SGOV" and signal.is_bull and signal.phase == 0
+            is_cash_gate = signal.next_hold == "SGOV" and signal.is_bull and signal.phase == 0 and not signal.chop_override
 
             st.markdown("**Live Path Check**")
             if signal.is_bull:
@@ -305,6 +285,8 @@ elif page == "Hold'em":
                     st.markdown("- WARN SPY < MA50 for 1 day -> await confirmation")
                 else:
                     st.markdown("- OK SPY > MA50 -> TQQQ")
+                if signal.chop_override:
+                    st.markdown(f"- CHOP QQQ vol20 {signal.qqq_vol20:.1%} -> {signal.next_hold} (RSI(2) leg {'active' if signal.rsi2_leg else 'inactive'})")
                 st.markdown(f"- {'OK' if signal.phase == 1 else 'NO'} Phase 1 UVXY hedge")
                 st.markdown(f"- {'OK' if signal.phase == 2 else 'NO'} Phase 2 SGOV cooldown")
                 st.markdown(f"- {'OK' if bull_overbought else 'NO'} RSI overbought trigger (>79)")
@@ -330,6 +312,9 @@ digraph HoldemTree {{
     cooldown [label="Cooldown complete?"];
     uvxy [label="Enter UVXY"];
     gate [label="SPY < MA50\\n2 days?"];
+    chop [label="Chop mode?\\nQQQ vol20 >25% on, <20% off"];
+    leg [label="RSI(2) leg active?\\nQQQ RSI2 < 15 & > 200SMA"];
+    chop_cash [label="Cash (SGOV)\\nchop mode"];
     tqqq [label="TQQQ (3x)"];
     cash_gate [label="Cash (SGOV)\\n50MA gate"];
     bear_rsi_tqqq [label="TQQQ RSI < 30?"];
@@ -350,7 +335,11 @@ digraph HoldemTree {{
     p2 -> p2 [label="Yes"];
     overbought -> cooldown [label="Yes"];
     overbought -> gate [label="No"];
-    gate -> tqqq [label="No (<2d below)"];
+    gate -> chop [label="No (<2d below)"];
+    chop -> tqqq [label="No"];
+    chop -> leg [label="Yes"];
+    leg -> tqqq [label="Yes"];
+    leg -> chop_cash [label="No"];
     gate -> cash_gate [label="Yes (2d+ below)"];
     cooldown -> uvxy [label="Yes"];
     cooldown -> p2 [label="No"];
@@ -366,32 +355,45 @@ digraph HoldemTree {{
     sqqq_cont -> tqqq_bear [label="No"];
 }}
 """
-            st.graphviz_chart(tree_dot, use_container_width=True)
+            st.graphviz_chart(tree_dot, width="stretch")
 
     except Exception as e:
         st.error(f"Hold'em signal failed: {e}")
 
 elif page == "TMT":
-    st.title("📈 TMT - RSI(2) + Idle Rotation")
+    page_header("TMT", "QQQ RSI(2) dip-buy into TQQQ · fixed biweekly RRG idle rotation · public snapshot")
     try:
         tmt = get_tmt_signal_snapshot()
         if not tmt["ready"]:
             st.warning(tmt["reason"])
+            render_tmt_idle_evaluation(tmt)
         else:
-            st.warning(f"{tmt['next_date']} -> {tmt['next_hold']} ({tmt['action']})")
-            st.caption(tmt["reason"])
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("QQQ RSI(2)", f"{tmt['qqq_rsi2']:.1f}")
-            m2.metric("QQQ", f"${tmt['qqq_price']:.2f}")
-            m3.metric("TQQQ", f"${tmt['tqqq_price']:.2f}")
-            m4.metric("Idle Breadth", f"{tmt['breadth']}%")
+            color = STRATEGY_COLORS["TMT"]
+            left, right = st.columns([3, 2], gap="medium")
+            with left, card("Next session", color, f"Daily signal {tmt.get('signal_asof', 'N/A')} · executes at next open"):
+                render_tmt_action(tmt)
+                render_tmt_idle_evaluation(tmt)
+            with right, card("Indicators", color, "Entry < 15 · exit > 80 · trend filter 200SMA"):
+                kpis(
+                    [
+                        {"label": "QQQ RSI(2)", "value": f"{tmt['qqq_rsi2']:.1f}"},
+                        {"label": "QQQ vs 200SMA", "value": f"${tmt['qqq_price']:,.2f}",
+                         "sub": f"SMA ${tmt['qqq_sma200']:,.2f} · {'above' if tmt['above_200'] else 'below'}"},
+                        {"label": "TQQQ", "value": f"${tmt['tqqq_price']:,.2f}"},
+                        {"label": f"Idle {tmt['dm_hold']}", "value": f"{tmt['breadth']}%", "sub": "Breadth"},
+                    ],
+                    columns=2,
+                    flat=True,
+                    compact=True,
+                )
 
-            with st.expander("Decision Tree", expanded=True):
+            with st.expander("Decision path", expanded=False):
                 st.markdown("**Public signal path (position state is intentionally omitted)**")
                 st.markdown(
                     "- RSI(2) < 15 and QQQ > 200SMA -> BUY TQQQ\n"
-                    "- RSI(2) > 80 -> EXIT TQQQ and rotate to Idle\n"
-                    "- Otherwise -> Idle rotation (RRG breadth + breakout)"
+                    "- RSI(2) > 80 or QQQ <= 200SMA -> EXIT TQQQ if held\n"
+                    "- Idle rotation only after a fixed 2-week evaluation with a changed target\n"
+                    "- Position-dependent -15% stop / 21-market-session cap requires holding data"
                 )
                 st.caption(f"Idle hold: {tmt['dm_hold']} | {tmt['idle_reason']}")
 
@@ -416,12 +418,12 @@ digraph TMTTree {{
     oversold [label="RSI(2) < 15?"];
     trend [label="QQQ > 200MA?\\n{'YES' if qqq_above else 'NO'}"];
     overbought [label="RSI(2) > 80?"];
-    buy [label="BUY TQQQ\\n(soft 7d, cap 21d)", fillcolor="{buy_fill}"];
+    buy [label="BUY TQQQ if flat\\n(cap 21 market sessions)", fillcolor="{buy_fill}"];
     sell [label="EXIT TQQQ\\nreturn to idle", fillcolor="{sell_fill}"];
     wait_notrend [label="WAIT\\n(no trend support)", fillcolor="{notrend_fill}"];
 
     subgraph cluster_idle {{
-        label="RRG Idle (biweekly)\\nBreadth: {breadth_pct}%";
+        label="RRG Idle (fixed 2-week close)\\nBreadth: {breadth_pct}%";
         color="#94a3b8";
         breadth_check [label="Breadth >= 40%?"];
         breakout_check [label="Sector breakout?\\n(Improving -> Leading)"];
@@ -444,26 +446,26 @@ digraph TMTTree {{
     overbought -> breadth_check [label="No"];
 }}
 """
-                st.graphviz_chart(tree_dot, use_container_width=True)
+                st.graphviz_chart(tree_dot, width="stretch")
 
     except Exception as e:
         st.error(f"TMT signal failed: {e}")
 
-    render_rrg_map("Sector Rotation Map (RRG)", "tmt_rrg")
+    st.subheader("Sector rotation")
+    render_rrg_map("Sector rotation map (RRG)", "tmt_rrg")
 
 elif page == "GEX Filter":
-    st.title("⚡ GEX Filter")
-    st.caption("Gamma exposure scan (public, no private account inputs)")
+    page_header("GEX Filter", "Gamma exposure scan · 38 tickers · 8 filters · public, no account inputs")
 
     rrg_quadrants = {}
     try:
-        idle_data = fetch_multiple(list(set(SECTOR_SPDR + ["SPY", "SGOV"])), period="2y")
-        idle_result = compute_idle_signal(idle_data, "SPY")
+        idle_data = fetch_multiple(list(set(SECTOR_SPDR + ["SPY"])), start=HISTORY_START)
+        idle_result = compute_idle_signal(idle_data, "SPY", state_path=IDLE_STATE_PATH)
         rrg_quadrants = idle_result.get("quadrants", {})
     except Exception:
         rrg_quadrants = {}
 
-    if st.button("Run GEX Scan", type="primary"):
+    if st.button("Run GEX scan", type="primary", icon=":material/radar:"):
         results = []
         failed = []
         progress = st.progress(0)
@@ -488,22 +490,25 @@ elif page == "GEX Filter":
         confirmed = [r for r in results if r["status"] == "CONFIRMED"]
         blocked = [r for r in results if r["status"] == "BLOCKED"]
 
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Confirmed", len(confirmed))
-        s2.metric("Blocked", len(blocked))
-        s3.metric("Failed", len(failed))
+        kpis([
+            {"label": "Confirmed", "value": str(len(confirmed)), "tone": "up" if confirmed else None},
+            {"label": "Blocked", "value": str(len(blocked))},
+            {"label": "Failed", "value": str(len(failed)), "tone": "down" if failed else None},
+        ])
 
         if confirmed:
             st.subheader("Confirmed Setups")
             for r in confirmed:
-                with st.expander(f"{r['ticker']} | R/R {r['rr']:.2f} | +{r['upside_pct']:.1f}%"):
-                    st.markdown(
-                        f"Spot ${r['spot']} | MaxGEX ${r['max_gex']} | PutWall {r['put_wall']} | "
-                        f"CallWall {r['call_wall']} | NetGEX {r['net_gex_sign']}"
-                    )
-                    for f in r["filters"].values():
-                        icon = "OK" if f["pass"] else "NO"
-                        st.caption(f"{icon} {f['label']}: {f['detail']}")
+                with st.expander(f"{r['ticker']} · R/R {r['rr']:.2f} · +{r['upside_pct']:.1f}%"):
+                    kpis([
+                        {"label": "Spot", "value": f"${r['spot']}"},
+                        {"label": "MaxGEX", "value": f"${r['max_gex']}"},
+                        {"label": "Put wall", "value": f"{r['put_wall']}"},
+                        {"label": "Call wall", "value": f"{r['call_wall']}"},
+                        {"label": "Net GEX", "value": f"{r['net_gex_sign']}"},
+                    ], compact=True)
+                    rows([(f"{'✓' if f['pass'] else '✗'} {f['label']}", f["detail"], "up" if f["pass"] else "down")
+                          for f in r["filters"].values()])
 
         table_rows = []
         for r in sorted(results, key=lambda x: x["passed"], reverse=True):
@@ -534,13 +539,12 @@ elif page == "GEX Filter":
             )
 
         if table_rows:
-            st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True, height=550)
+            st.dataframe(pd.DataFrame(table_rows), width="stretch", hide_index=True, height=550)
     else:
-        st.info("Run scan to evaluate all tickers with 8 filters")
+        st.caption("Run the scan to evaluate all tickers with 8 filters.")
 
 elif page == "SPX BWB":
-    st.title("🦋 SPX BWB Daily Playbook")
-    st.caption("Signal and structure guidance only (no position tracking)")
+    page_header("SPX BWB Daily Playbook", "Signal and structure guidance only · no position tracking")
 
     import yfinance as yf
 
@@ -562,10 +566,6 @@ elif page == "SPX BWB":
     spx_chg = (spx - float(m["spx_prev"])) / float(m["spx_prev"]) * 100 if m["spx_prev"] else 0
     vix_chg = (vix - float(m["vix_prev"])) / float(m["vix_prev"]) * 100 if m["vix_prev"] else 0
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("SPX", f"{spx:,.0f}", f"{spx_chg:+.2f}%")
-    c2.metric("VIX", f"{vix:.1f}", f"{vix_chg:+.1f}%")
-
     if vix < 14:
         regime = "Low Vol"
     elif vix < 20:
@@ -578,10 +578,13 @@ elif page == "SPX BWB":
         regime = "Extreme"
 
     can_enter = 13 <= vix <= 28
-    c3.metric("VIX Regime", regime)
-    c4.metric("Entry", "Allowed" if can_enter else "Avoid")
+    kpis([
+        {"label": "SPX", "value": f"{spx:,.0f}", "sub": f"{spx_chg:+.2f}%"},
+        {"label": "VIX", "value": f"{vix:.1f}", "sub": f"{vix_chg:+.1f}%"},
+        {"label": "VIX regime", "value": regime, "tone": "down" if vix >= 28 else None},
+        {"label": "Entry", "value": "Allowed" if can_enter else "Avoid", "tone": "up" if can_enter else "down"},
+    ])
 
-    st.markdown("---")
     vix_scale = min(1.5, max(0.75, vix / 18.0))
     dte = 40 if vix > 25 else 50
 
@@ -592,16 +595,16 @@ elif page == "SPX BWB":
     cvl = cvs + 30
     exp = dt.date.today() + dt.timedelta(days=dte)
 
-    st.subheader("Suggested Structure")
-    st.markdown(
-        f"- Expiry: {exp.isoformat()} (DTE {dte})\n"
-        f"- Put BWB: Buy {k1} / Sell 2x {k2} / Buy {k3}\n"
-        f"- Call Vertical: Sell {cvs} / Buy {cvl}"
-    )
-
+    st.subheader("Suggested structure")
     if can_enter:
-        st.success("Entry window is open under VIX filter")
+        banner("Entry window is open", f"VIX {vix:.1f} inside the 13–28 band", tone="up", label="Open")
     else:
-        st.warning("No entry: wait for VIX to return to 13-28 band")
+        banner("No entry", f"VIX {vix:.1f}: wait for the 13–28 band", tone="down", label="Wait")
+    with st.columns(2)[0]:
+        rows([
+            ("Expiry", f"{exp.isoformat()} (DTE {dte})"),
+            ("Put BWB", f"Buy {k1} / Sell 2x {k2} / Buy {k3}"),
+            ("Call vertical", f"Sell {cvs} / Buy {cvl}"),
+        ])
 
 st.caption(f"Updated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")

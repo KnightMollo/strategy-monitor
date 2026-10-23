@@ -11,7 +11,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from lib.holdem_chop import apply_chop, chop_snapshot
 from lib.market_data import compute_rsi, compute_sma, fetch_multiple
+from lib.tmt_rules import market_calendar, rule_clock
 
 
 @dataclass
@@ -35,6 +37,11 @@ class HoldemSignal:
     rsi_sqqq: float = 0.0
     rsi_tlt: float = 0.0
     is_bull: bool = True
+    qqq_vol20: float = 0.0
+    qqq_rsi2: float = 0.0
+    chop_on: bool = False
+    rsi2_leg: bool = False
+    chop_override: bool = False
 
 
 @dataclass
@@ -48,14 +55,22 @@ class HoldemConfig:
     cooldown_days: int = 10
     pullback_pct: float = 0.02
     max_uvxy_days: int = 5
+    chop_mode: bool = True
 
 
-def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
+def last_completed_session(now=None) -> pd.Timestamp:
+    """Latest XNYS session whose close has passed (exchange time, not the local clock)."""
+    schedule = market_calendar().schedule
+    return schedule.index[schedule["close"] <= rule_clock(now)][-1]
+
+
+def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal:
     """Compute the current Hold'em signal using live market data.
 
      Decision tree:
      ┌─ SPY > MA100? (Bull market)
      │  ├─ Phase 0: Hold TQQQ, with 50MA 2-day cash gate
+     │  │    └─ Chop mode (QQQ vol20 >25% on, <20% off): TQQQ only during RSI(2) leg, else SGOV
      │  ├─ Phase 1: Hold UVXY (max 5 days)
      │  └─ Phase 2: Hold SGOV cooldown
      └─ SPY ≤ MA100 (Bear market)
@@ -66,7 +81,8 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
     if config is None:
         config = HoldemConfig()
 
-    price_data = fetch_multiple(config.tickers, period="2y")
+    tickers = list(dict.fromkeys([*config.tickers, "QQQ"])) if config.chop_mode else list(config.tickers)
+    price_data = fetch_multiple(tickers, period="2y")
 
     if not price_data or "SPY" not in price_data or "TQQQ" not in price_data:
         return HoldemSignal(
@@ -77,11 +93,12 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
         )
 
     # Build aligned close series
-    all_indices = [price_data[t].index for t in config.tickers if t in price_data]
+    all_indices = [price_data[t].index for t in tickers if t in price_data]
     common_idx = all_indices[0]
     for idx in all_indices[1:]:
         common_idx = common_idx.intersection(idx)
     common_idx = common_idx.sort_values()
+    common_idx = common_idx[common_idx.normalize() <= last_completed_session(now)]
 
     if len(common_idx) < 220:
         return HoldemSignal(
@@ -92,7 +109,7 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
         )
 
     close = {}
-    for t in config.tickers:
+    for t in tickers:
         if t in price_data:
             close[t] = price_data[t]["Close"].reindex(common_idx)
 
@@ -107,12 +124,7 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
     rsi_sqqq = compute_rsi(close["SQQQ"], config.rsi_period)
     rsi_tlt = compute_rsi(close["TLT"], config.rsi_period)
 
-    # Use last completed bar
     i = len(common_idx) - 1
-    today = pd.Timestamp(dt.date.today())
-    now = dt.datetime.now()
-    if common_idx[i] == today and now.hour < 16 and i > 0:
-        i -= 1
 
     # Run state machine from start to current bar
     phase = 0
@@ -198,6 +210,19 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
 
     tqqq_retrace = tqqq_peak * (1 - PULLBACK_PCT) if np.isfinite(tqqq_peak) else np.nan
 
+    cooldown_remaining = 0
+    uvxy_lock_until = ""
+    if last_cooldown_start_date is not None and phase == 2:
+        elapsed = (common_idx[i] - last_cooldown_start_date).days
+        cooldown_remaining = max(0, COOLDOWN_DAYS - elapsed)
+        lock_end = last_cooldown_start_date + pd.Timedelta(days=COOLDOWN_DAYS)
+        uvxy_lock_until = lock_end.strftime("%Y-%m-%d")
+
+    chop_override = False
+    chop = None
+    if config.chop_mode and "QQQ" in close:
+        chop = chop_snapshot(close["QQQ"], price_data["TQQQ"]["Open"].reindex(common_idx), close["TQQQ"], i)
+
     # Determine next hold
     if not np.isfinite(spy_ma_val):
         next_hold = config.safe_asset
@@ -241,6 +266,8 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
             else:
                 next_hold = "TQQQ"
                 condition = f"Bull TQQQ: SPY near MA50 ({spy_val:.2f} vs {spy_ma50_val:.2f}), awaiting 2d confirm"
+            if chop is not None:
+                next_hold, condition, chop_override = apply_chop(next_hold, condition, chop, config.safe_asset)
     else:
         if np.isfinite(v_rsi_tqqq) and v_rsi_tqqq < 30:
             next_hold = "TQQQ"
@@ -268,15 +295,6 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
             next_hold = "TQQQ"
             condition = "Bear default TQQQ: No rebound or defense signal"
 
-    # Cooldown remaining
-    cooldown_remaining = 0
-    uvxy_lock_until = ""
-    if last_cooldown_start_date is not None and phase == 2:
-        elapsed = (common_idx[i] - last_cooldown_start_date).days
-        cooldown_remaining = max(0, COOLDOWN_DAYS - elapsed)
-        lock_end = last_cooldown_start_date + pd.Timedelta(days=COOLDOWN_DAYS)
-        uvxy_lock_until = lock_end.strftime("%Y-%m-%d")
-
     return HoldemSignal(
         signal_date=signal_date,
         next_hold=next_hold,
@@ -296,4 +314,9 @@ def compute_holdem_signal(config: HoldemConfig = None) -> HoldemSignal:
         rsi_sqqq=v_rsi_sqqq if np.isfinite(v_rsi_sqqq) else 0,
         rsi_tlt=v_rsi_tlt if np.isfinite(v_rsi_tlt) else 0,
         is_bull=is_bull,
+        qqq_vol20=chop["qqq_vol20"] if chop else 0.0,
+        qqq_rsi2=chop["qqq_rsi2"] if chop else 0.0,
+        chop_on=chop["chop_on"] if chop else False,
+        rsi2_leg=chop["leg_active"] if chop else False,
+        chop_override=chop_override,
     )

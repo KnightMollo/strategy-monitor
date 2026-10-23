@@ -20,7 +20,9 @@ def _normalize_ticker(symbol: str) -> str:
     return _TICKER_MAP.get(symbol.upper(), symbol)
 
 
-def _cache_path(ticker: str) -> Path:
+def _cache_path(ticker: str, start: str | None = None) -> Path:
+    if start is not None:
+        return CACHE_DIR / f"{ticker.upper()}__from-{pd.Timestamp(start).date().isoformat()}__1d.parquet"
     return CACHE_DIR / f"{ticker.upper()}.parquet"
 
 
@@ -39,15 +41,24 @@ def _is_cache_fresh(path: Path, min_rows: int = 100) -> bool:
     return True
 
 
-def fetch_prices(ticker: str, period: str = "2y", force_refresh: bool = False) -> pd.DataFrame:
+def fetch_prices(ticker: str, period: str = "2y", force_refresh: bool = False, start: str | None = None) -> pd.DataFrame:
     """Fetch daily OHLCV for a ticker."""
     ticker = _normalize_ticker(ticker)
-    cache = _cache_path(ticker)
+    cache = _cache_path(ticker, start=start)
 
     if not force_refresh and _is_cache_fresh(cache):
-        return pd.read_parquet(cache)
+        cached = pd.read_parquet(cache)
+        if start is None:
+            return cached
+        from lib.tmt_rules import market_calendar, rule_clock
+        schedule = market_calendar().schedule
+        latest = schedule.index[schedule["close"] <= rule_clock()][-1]
+        if cached.index.max().normalize() >= latest:
+            return cached
 
-    data = yf.download(ticker, period=period, interval="1d", progress=False, auto_adjust=True)
+    request = {"interval": "1d", "progress": False, "auto_adjust": True}
+    request["start" if start is not None else "period"] = start if start is not None else period
+    data = yf.download(ticker, **request)
     if data.empty:
         if cache.exists():
             return pd.read_parquet(cache)
@@ -75,11 +86,11 @@ def fetch_prices(ticker: str, period: str = "2y", force_refresh: bool = False) -
     return data
 
 
-def fetch_multiple(tickers: list[str], period: str = "2y", force_refresh: bool = False) -> Dict[str, pd.DataFrame]:
+def fetch_multiple(tickers: list[str], period: str = "2y", force_refresh: bool = False, start: str | None = None) -> Dict[str, pd.DataFrame]:
     result = {}
     for t in tickers:
         try:
-            df = fetch_prices(t, period=period, force_refresh=force_refresh)
+            df = fetch_prices(t, period=period, force_refresh=force_refresh, start=start)
             if not df.empty:
                 result[t] = df
         except Exception:

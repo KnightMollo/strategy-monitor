@@ -1,7 +1,8 @@
-streamlit>=1.30
+streamlit>=1.60
 pandas>=2.0
 numpy>=1.24
 yfinance>=0.2.30
 pyarrow>=14.0
 plotly>=5.18
 scipy>=1.10
+exchange-calendars>=4.11,<5

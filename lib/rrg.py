@@ -8,6 +8,7 @@ from typing import Dict, List
 
 import numpy as np
 import pandas as pd
+from lib.tmt_rules import completed_data, frozen_rrg_frame, idle_dates, idle_from_frame, lock_idle_evaluation
 
 RRG_BASKET = [
     "XLK", "XLF", "XLE", "XLI", "XLY", "XLP", "XLV",
@@ -150,18 +151,13 @@ def detect_signals(rrg_df: pd.DataFrame) -> List[Dict]:
 
 
 def _resample_close(daily_closes: Dict[str, pd.DataFrame], rule: str) -> Dict[str, pd.Series]:
-    """Convert daily OHLCV data to completed fixed-frequency close series."""
+    """Convert daily OHLCV data to a fixed-frequency close series."""
     weekly = {}
     for ticker, df in daily_closes.items():
         if df.empty:
             continue
         close = df["Close"].squeeze() if isinstance(df["Close"], pd.DataFrame) else df["Close"]
         w = close.resample(rule).last().dropna()
-        # Resampling labels a partially formed bucket with its future period-end
-        # date. Exclude that bucket so biweekly RRG only advances after Friday's
-        # close, matching the TMT idle calculation in Local Dashboard.
-        latest_source_date = pd.Timestamp(close.index.max()).normalize()
-        w = w[w.index <= latest_source_date]
         if len(w) > 10:
             weekly[ticker] = w
     return weekly
@@ -174,10 +170,12 @@ def resample_weekly(daily_closes: Dict[str, pd.DataFrame]) -> Dict[str, pd.Serie
 
 def resample_biweekly(daily_closes: Dict[str, pd.DataFrame]) -> Dict[str, pd.Series]:
     """Convert daily OHLCV data to the biweekly Friday closes used by TMT idle RRG."""
-    return _resample_close(daily_closes, "2W-FRI")
+    cutoff = idle_dates()["expected_period"]
+    return {ticker: data["Close"].resample("336h", origin="2019-06-07", closed="right", label="right").last().dropna().loc[:cutoff]
+            for ticker, data in completed_data(daily_closes).items() if not data.empty}
 
 
-def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = "SPY") -> Dict:
+def compute_legacy_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = "SPY") -> Dict:
     """Compute TMT idle signal: RRG breakout + SGOV safety net."""
     close = {}
     for t in SECTOR_SPDR + [benchmark]:
@@ -189,11 +187,7 @@ def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = 
     if benchmark not in close:
         return {"hold": "SGOV", "breadth": 0, "breakout_ticker": None, "quadrants": {}, "reason": "Benchmark data unavailable"}
 
-    biweekly = resample_biweekly(daily_closes)
-    if benchmark not in biweekly:
-        return {"hold": "SGOV", "breadth": 0, "breakout_ticker": None, "quadrants": {}, "reason": "Insufficient benchmark data"}
-
-    spy_bw = biweekly[benchmark]
+    spy_bw = close[benchmark].resample("2W-FRI").last().dropna()
     sector_rr = {}
     sector_rm = {}
     period = 7
@@ -201,9 +195,7 @@ def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = 
     for t in SECTOR_SPDR:
         if t not in close:
             continue
-        if t not in biweekly:
-            continue
-        tw = biweekly[t]
+        tw = close[t].resample("2W-FRI").last().dropna()
         cw = tw.index.intersection(spy_bw.index)
         if len(cw) <= period * 2 + 5:
             continue
@@ -271,3 +263,17 @@ def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = 
         "quadrants": quadrants,
         "reason": reason,
     }
+
+
+def compute_idle_rrg(daily_closes: Dict[str, pd.DataFrame], benchmark: str = RRG_BENCHMARK,
+                     tail_length: int = 1, *, now=None) -> pd.DataFrame:
+    frame = frozen_rrg_frame(daily_closes, tail_length=tail_length, benchmark=benchmark, now=now)
+    if not frame.empty:
+        frame["label"] = frame["ticker"].map(SECTOR_MAP)
+    return frame
+
+
+def compute_idle_signal(daily_closes: Dict[str, pd.DataFrame], benchmark: str = "SPY",
+                        *, now=None, state_path=None) -> Dict:
+    signal = idle_from_frame(compute_idle_rrg(daily_closes, benchmark, tail_length=2, now=now), now)
+    return lock_idle_evaluation(signal, state_path, now) if state_path is not None else signal

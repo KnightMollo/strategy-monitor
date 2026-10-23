@@ -10,7 +10,35 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from lib.market_data import fetch_prices, compute_sma
+from lib.market_data import CACHE_DIR, fetch_multiple, fetch_prices, compute_sma
+from lib.rrg import compute_idle_signal
+from lib.tmt_rules import HISTORY_START, SECTORS, VERSION, completed_data, format_idle_evaluation, rule_clock, rsi_snapshot, select_action
+
+IDLE_STATE_PATH = CACHE_DIR / f"tmt_idle_{VERSION}.json"
+
+
+def compute_tmt_snapshot(*, now=None) -> dict:
+    moment = rule_clock(now)
+    prices = completed_data({"QQQ": fetch_prices("QQQ", start=HISTORY_START),
+                             "TQQQ": fetch_prices("TQQQ", start=HISTORY_START)}, moment)
+    idle = compute_idle_signal(fetch_multiple(list(SECTORS) + ["SPY"], start=HISTORY_START),
+                               now=moment, state_path=IDLE_STATE_PATH)
+    evaluation = format_idle_evaluation(idle, moment)
+    qqq, tqqq = prices["QQQ"], prices["TQQQ"]
+    if qqq.empty or len(qqq) < 200 or tqqq.empty or qqq.index[-1] != tqqq.index[-1]:
+        return {"ready": False, "reason": "Completed QQQ/TQQQ data unavailable", "idle_evaluation": evaluation}
+    snapshot = rsi_snapshot(qqq, tqqq)
+    decision = select_action(snapshot, idle, in_tqqq=None, now=moment)
+    if decision["action_type"].startswith("IDLE"):
+        decision["reason"] += f" | {evaluation['reason']}"
+    labels = {"TQQQ_ENTRY": "BUY TQQQ if flat", "TQQQ_EXIT": "EXIT TQQQ if held",
+              "IDLE_REBALANCE": "ROTATE if currently idle"}
+    return {**snapshot, **decision, "ready": True, "position_aware": False,
+            "action": labels.get(decision["action_type"], "NO NEW ORDER"),
+            "dm_hold": evaluation["target"], "idle_reason": evaluation["reason"],
+            "dm_reason": evaluation["reason"], "breadth": round(idle.get("breadth", 0) * 100),
+            "breakout_ticker": idle.get("breakout_ticker"), "rrg_asof": idle.get("rrg_asof"),
+            "idle_evaluation": evaluation}
 
 
 @dataclass
@@ -38,55 +66,16 @@ def compute_rsi2(series: pd.Series) -> pd.Series:
 
 
 def compute_tmt_signal() -> TMTSignal:
-    """Compute TMT RSI(2) signal using live data.
-
-    Decision tree:
-    ┌─ QQQ > 200SMA?
-    │  ├─ RSI(2) < 15 → BUY TQQQ (hold up to 10 days or RSI > 80)
-    │  ├─ RSI(2) > 80 → SELL TQQQ
-    │  └─ Otherwise → WAIT
-    └─ QQQ ≤ 200SMA → WAIT (no entries below trend)
-    """
-    qqq = fetch_prices("QQQ", period="2y")
-    tqqq = fetch_prices("TQQQ", period="1y")
-
-    if qqq.empty or len(qqq) < 252 or tqqq.empty:
-        return TMTSignal(
-            signal_date=dt.date.today().isoformat(),
-            action="WAIT",
-            qqq_rsi2=0, qqq_price=0, qqq_sma200=0,
-            above_200=False, tqqq_price=0,
-            reason="Insufficient data",
-        )
-
-    close_qqq = qqq["Close"]
-    rsi2 = compute_rsi2(close_qqq)
-    sma200 = compute_sma(close_qqq, 200)
-
-    curr_rsi2 = float(rsi2.iloc[-1])
-    curr_qqq = float(close_qqq.iloc[-1])
-    curr_sma200 = float(sma200.iloc[-1])
-    curr_tqqq = float(tqqq["Close"].iloc[-1])
-    above_200 = curr_qqq > curr_sma200
-
-    if curr_rsi2 < 15 and above_200:
-        action = "BUY TQQQ"
-        reason = f"RSI(2)={curr_rsi2:.1f} < 15, QQQ ({curr_qqq:.1f}) > 200SMA ({curr_sma200:.1f})"
-    elif curr_rsi2 > 80:
-        action = "SELL TQQQ"
-        reason = f"RSI(2)={curr_rsi2:.1f} > 80 → exit"
-    else:
-        action = "WAIT"
-        trend = "above" if above_200 else "BELOW"
-        reason = f"RSI(2)={curr_rsi2:.1f} | QQQ {trend} 200SMA"
-
+    """Backward-compatible RSI view of the frozen public snapshot."""
+    snapshot = compute_tmt_snapshot()
+    actions = {"TQQQ_ENTRY": "BUY TQQQ", "TQQQ_EXIT": "SELL TQQQ"}
     return TMTSignal(
-        signal_date=dt.date.today().isoformat(),
-        action=action,
-        qqq_rsi2=round(curr_rsi2, 1),
-        qqq_price=round(curr_qqq, 2),
-        qqq_sma200=round(curr_sma200, 2),
-        above_200=above_200,
-        tqqq_price=round(curr_tqqq, 2),
-        reason=reason,
+        signal_date=snapshot.get("signal_asof", dt.date.today().isoformat()),
+        action=actions.get(snapshot.get("action_type"), "WAIT"),
+        qqq_rsi2=round(snapshot.get("qqq_rsi2", 0), 1),
+        qqq_price=round(snapshot.get("qqq_price", 0), 2),
+        qqq_sma200=round(snapshot.get("qqq_sma200", 0), 2),
+        above_200=snapshot.get("above_200", False),
+        tqqq_price=round(snapshot.get("tqqq_price", 0), 2),
+        reason=snapshot["reason"],
     )
