@@ -14,6 +14,14 @@ import numpy as np
 import pandas as pd
 
 VERSION = "tmt-fixed-2w-spy-v1"
+# Separate from VERSION so the locked idle-evaluation history is not invalidated.
+SNIPER_VERSION = "tmt-bear-sniper-v1"
+BEAR_ENTRY_RSI = 5
+BEAR_EXIT_RSI = 60
+BEAR_MAX_HOLD = 5
+BEAR_STOP = 0.10
+BULL_STOP = 0.15
+BULL_MAX_HOLD = 21
 HISTORY_START = "2019-06-03"
 ANCHOR = pd.Timestamp("2019-06-07")
 SECTORS = ("XLK", "XLF", "XLE", "XLI", "XLY", "XLP", "XLV", "XLU", "XLB", "XLRE", "XLC")
@@ -256,35 +264,61 @@ def rsi_snapshot(qqq: pd.DataFrame, tqqq: pd.DataFrame) -> dict:
             "above_200": bool(close.iloc[-1] > sma.iloc[-1])}
 
 
+def entry_leg(qqq: pd.DataFrame, entry_date) -> str:
+    """Leg of an open TQQQ position: QQQ vs 200SMA at the last close before the entry session."""
+    close = qqq["Close"]
+    sma = close.rolling(200).mean()
+    prior = close.index[close.index.normalize() < pd.Timestamp(entry_date).normalize()]
+    if prior.empty or not np.isfinite(sma.loc[prior[-1]]):
+        return "bull"
+    return "bull" if close.loc[prior[-1]] > sma.loc[prior[-1]] else "bear"
+
+
 def select_action(snapshot: dict, idle: dict, *, in_tqqq: bool | None = False,
-                  current_idle: str | None = None, entry_price=None, entry_date=None, now=None) -> dict:
+                  current_idle: str | None = None, entry_price=None, entry_date=None,
+                  leg: str = "bull", now=None) -> dict:
     moment = rule_clock(now)
     execution = next_session(snapshot["signal_asof"])
     active_rsi = moment < market_calendar().session_open(execution)
+    rsi, above = snapshot["qqq_rsi2"], snapshot["above_200"]
+    bear = bool(in_tqqq) and leg == "bear"
+    stop_pct, max_hold = (BEAR_STOP, BEAR_MAX_HOLD) if bear else (BULL_STOP, BULL_MAX_HOLD)
     days = held_sessions(entry_date, snapshot["signal_asof"]) if entry_date is not None else 0
     position_has_close = entry_date is None or pd.Timestamp(entry_date).normalize() <= pd.Timestamp(snapshot["signal_asof"])
     drawdown = snapshot["tqqq_price"] / entry_price - 1 if entry_price and position_has_close else None
-    stop = drawdown is not None and drawdown <= -0.15
+    stop = drawdown is not None and drawdown <= -stop_pct
     target = idle.get("hold") if idle.get("ready") else None
     result = {"next_date": None, "next_hold": "TQQQ" if in_tqqq else current_idle,
               "action_type": "HOLD", "days_held": days,
               "tqqq_dd_pct": drawdown * 100 if drawdown is not None else None,
-              "stop_hit": stop, "rule_version": VERSION}
+              "stop_hit": stop, "rule_version": VERSION, "sniper_version": SNIPER_VERSION,
+              "leg": ("bear" if bear else "bull") if in_tqqq else None,
+              "stop_pct": stop_pct, "max_hold": max_hold}
     if in_tqqq and not position_has_close:
         result["reason"] = "New TQQQ position; await its first completed market close"
         return result
+    bear_entry = not above and rsi < BEAR_ENTRY_RSI
     exit_reason = None
     if in_tqqq:
         if stop:
-            exit_reason = f"Stop {drawdown:+.1%} <= -15%"
-        elif not snapshot["above_200"]:
+            exit_reason = f"Stop {drawdown:+.1%} <= -{stop_pct:.0%}"
+        elif bear:
+            if rsi > BEAR_EXIT_RSI:
+                exit_reason = f"Bear leg: RSI(2)={rsi:.1f} > {BEAR_EXIT_RSI}"
+            elif days >= BEAR_MAX_HOLD:
+                exit_reason = f"Bear leg day {days} cap ({BEAR_MAX_HOLD}d actual market sessions)"
+        elif not above:
             exit_reason = "QQQ <= 200SMA: trend exit"
-        elif snapshot["qqq_rsi2"] > 80:
-            exit_reason = f"RSI(2)={snapshot['qqq_rsi2']:.1f} > 80"
-        elif days >= 21:
-            exit_reason = f"Day {days} safety cap (21d actual market sessions)"
-    elif in_tqqq is None and (snapshot["qqq_rsi2"] > 80 or not snapshot["above_200"]):
-        exit_reason = "RSI/trend exit if TQQQ is held; position stop/time cap unavailable"
+        elif rsi > 80:
+            exit_reason = f"RSI(2)={rsi:.1f} > 80"
+        elif days >= BULL_MAX_HOLD:
+            exit_reason = f"Day {days} safety cap ({BULL_MAX_HOLD}d actual market sessions)"
+    elif in_tqqq is None and not bear_entry:
+        if rsi > 80 or (not above and rsi > BEAR_EXIT_RSI):
+            exit_reason = "RSI/trend exit if TQQQ is held; position stop/time cap unavailable"
+        elif not above:
+            exit_reason = (f"Trend exit if a bull-leg TQQQ is held (a bear leg holds until RSI(2) > {BEAR_EXIT_RSI}); "
+                           "position stop/time cap unavailable")
     if exit_reason:
         result.update(action_type="TQQQ_EXIT" if active_rsi else "RECONCILE_RSI",
                       next_hold=target if active_rsi else result["next_hold"],
@@ -292,13 +326,20 @@ def select_action(snapshot: dict, idle: dict, *, in_tqqq: bool | None = False,
                       reason=exit_reason + ("; idle target unavailable" if target is None else f"; return to {target}"))
         return result
     if in_tqqq:
-        result["reason"] = f"Hold TQQQ; RSI(2)={snapshot['qqq_rsi2']:.1f}, day {days}"
+        result["reason"] = f"Hold TQQQ ({result['leg']} leg); RSI(2)={rsi:.1f}, day {days} of {max_hold}"
         return result
-    if snapshot["qqq_rsi2"] < 15 and snapshot["above_200"]:
+    if (rsi < 15 and above) or bear_entry:
+        if bear_entry:
+            reason = (f"Bear sniper: RSI(2)={rsi:.1f} < {BEAR_ENTRY_RSI} and QQQ <= 200SMA; "
+                      f"exit RSI(2) > {BEAR_EXIT_RSI}, {BEAR_MAX_HOLD} sessions or -{BEAR_STOP:.0%}")
+            if in_tqqq is None:
+                reason += "; a held bull-leg TQQQ takes the trend exit instead"
+        else:
+            reason = f"RSI(2)={rsi:.1f} < 15 and QQQ > 200SMA"
         result.update(action_type="TQQQ_ENTRY" if active_rsi else "RECONCILE_RSI",
                       next_hold="TQQQ" if active_rsi else current_idle,
                       next_date=execution.strftime("%Y-%m-%d") if active_rsi else None,
-                      reason=f"RSI(2)={snapshot['qqq_rsi2']:.1f} < 15 and QQQ > 200SMA")
+                      leg="bear" if bear_entry else "bull", reason=reason)
         return result
     if target is None:
         result.update(action_type="IDLE_UNAVAILABLE", reason="Idle data unavailable; no new idle order")

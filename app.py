@@ -373,12 +373,12 @@ elif page == "TMT":
             with left, card("Next session", color, f"Daily signal {tmt.get('signal_asof', 'N/A')} · executes at next open"):
                 render_tmt_action(tmt)
                 render_tmt_idle_evaluation(tmt)
-            with right, card("Indicators", color, "Entry < 15 · exit > 80 · trend filter 200SMA"):
+            with right, card("Indicators", color, "Bull: entry < 15 · exit > 80 · Bear sniper: entry < 5 · exit > 60"):
                 kpis(
                     [
                         {"label": "QQQ RSI(2)", "value": f"{tmt['qqq_rsi2']:.1f}"},
                         {"label": "QQQ vs 200SMA", "value": f"${tmt['qqq_price']:,.2f}",
-                         "sub": f"SMA ${tmt['qqq_sma200']:,.2f} · {'above' if tmt['above_200'] else 'below'}"},
+                         "sub": f"SMA ${tmt['qqq_sma200']:,.2f} · {'above (bull leg)' if tmt['above_200'] else 'below (bear sniper)'}"},
                         {"label": "TQQQ", "value": f"${tmt['tqqq_price']:,.2f}"},
                         {"label": f"Idle {tmt['dm_hold']}", "value": f"{tmt['breadth']}%", "sub": "Breadth"},
                     ],
@@ -390,10 +390,11 @@ elif page == "TMT":
             with st.expander("Decision path", expanded=False):
                 st.markdown("**Public signal path (position state is intentionally omitted)**")
                 st.markdown(
-                    "- RSI(2) < 15 and QQQ > 200SMA -> BUY TQQQ\n"
-                    "- RSI(2) > 80 or QQQ <= 200SMA -> EXIT TQQQ if held\n"
+                    "- RSI(2) < 15 and QQQ > 200SMA -> BUY TQQQ (bull leg)\n"
+                    "- RSI(2) > 80 or QQQ <= 200SMA -> EXIT a bull-leg TQQQ if held\n"
+                    "- Bear sniper: RSI(2) < 5 and QQQ <= 200SMA -> BUY TQQQ; exit RSI(2) > 60, 5 market sessions or -10%, no trend exit\n"
                     "- Idle rotation only after a fixed 2-week evaluation with a changed target\n"
-                    "- Position-dependent -15% stop / 21-market-session cap requires holding data"
+                    "- Position-dependent stops (-15% / -10%) and caps (21 / 5 sessions) require holding data"
                 )
                 st.caption(f"Idle hold: {tmt['dm_hold']} | {tmt['idle_reason']}")
 
@@ -406,7 +407,8 @@ elif page == "TMT":
                 sell_fill = "#fecaca" if qqq_r > 80 else "#f8fafc"
                 idle_fill = "#ddd6fe" if tmt["next_hold"] == "SGOV" else "#f8fafc"
                 sector_fill = "#bfdbfe" if tmt["next_hold"] not in ("SGOV", "SPY", "TQQQ") else "#f8fafc"
-                notrend_fill = "#bfdbfe" if not qqq_above and qqq_r < 15 else "#f8fafc"
+                notrend_fill = "#bfdbfe" if not qqq_above and 5 <= qqq_r < 15 else "#f8fafc"
+                bear_fill = "#bbf7d0" if not qqq_above and qqq_r < 5 else "#f8fafc"
                 tree_dot = f"""
 digraph TMTTree {{
     rankdir=TB;
@@ -421,6 +423,8 @@ digraph TMTTree {{
     buy [label="BUY TQQQ if flat\\n(cap 21 market sessions)", fillcolor="{buy_fill}"];
     sell [label="EXIT TQQQ\\nreturn to idle", fillcolor="{sell_fill}"];
     wait_notrend [label="WAIT\\n(no trend support)", fillcolor="{notrend_fill}"];
+    bear_check [label="RSI(2) < 5?\\n(bear sniper)"];
+    bear_buy [label="BUY TQQQ if flat\\nexit RSI>60 / 5 sessions / -10%", fillcolor="{bear_fill}"];
 
     subgraph cluster_idle {{
         label="RRG Idle (fixed 2-week close)\\nBreadth: {breadth_pct}%";
@@ -441,7 +445,9 @@ digraph TMTTree {{
     oversold -> trend [label="Yes"];
     oversold -> breadth_check [label="No (idle)"];
     trend -> buy [label="Yes"];
-    trend -> wait_notrend [label="No"];
+    trend -> bear_check [label="No"];
+    bear_check -> bear_buy [label="Yes"];
+    bear_check -> wait_notrend [label="No"];
     overbought -> sell [label="Yes"];
     overbought -> breadth_check [label="No"];
 }}
