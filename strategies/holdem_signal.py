@@ -56,6 +56,8 @@ class HoldemConfig:
     pullback_pct: float = 0.02
     max_uvxy_days: int = 5
     chop_mode: bool = True
+    # SPY 50MA cash gate, removed 2026-10-29 (Report/gate_study); True restores the old rule.
+    cash_gate: bool = False
 
 
 def last_completed_session(now=None) -> pd.Timestamp:
@@ -69,7 +71,7 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
 
      Decision tree:
      ┌─ SPY > MA100? (Bull market)
-     │  ├─ Phase 0: Hold TQQQ, with 50MA 2-day cash gate
+     │  ├─ Phase 0: Hold TQQQ (50MA cash gate removed 2026-10-29)
      │  │    └─ Chop mode (QQQ vol20 >25% on, <20% off): TQQQ only during RSI(2) leg, else SGOV
      │  ├─ Phase 1: Hold UVXY (max 5 days)
      │  └─ Phase 2: Hold SGOV cooldown
@@ -245,9 +247,12 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
             else:
                 condition = f"Cooldown complete. Waiting for RSI > {config.rsi_overbought} to re-enter UVXY or TQQQ < {tqqq_retrace:.2f}"
         else:
+            next_hold = "TQQQ"
+            condition = f"Bull TQQQ: SPY {spy_val:.2f} > MA100 {spy_ma_val:.2f}"
             spy_ma50_val = float(ma50_spy.iloc[i]) if pd.notna(ma50_spy.iloc[i]) else np.nan
-            days_below_50 = 0
-            if np.isfinite(spy_ma50_val):
+            if config.cash_gate and np.isfinite(spy_ma50_val):
+                # Legacy: 2 consecutive closes below MA50 -> cash, 1 close above -> TQQQ
+                days_below_50 = 0
                 for lookback in range(min(5, i)):
                     idx = i - lookback
                     prev_spy = float(close["SPY"].iloc[idx])
@@ -256,16 +261,9 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
                         days_below_50 += 1
                     else:
                         break
-
-            if np.isfinite(spy_ma50_val) and days_below_50 >= 2:
-                next_hold = config.safe_asset
-                condition = f"Bull cash (50MA gate): SPY below MA50 for {days_below_50}d ({spy_val:.2f} < {spy_ma50_val:.2f})"
-            elif np.isfinite(spy_ma50_val) and spy_val > spy_ma50_val:
-                next_hold = "TQQQ"
-                condition = f"Bull TQQQ: SPY {spy_val:.2f} > MA50 {spy_ma50_val:.2f} & MA100 {spy_ma_val:.2f}"
-            else:
-                next_hold = "TQQQ"
-                condition = f"Bull TQQQ: SPY near MA50 ({spy_val:.2f} vs {spy_ma50_val:.2f}), awaiting 2d confirm"
+                if days_below_50 >= 2:
+                    next_hold = config.safe_asset
+                    condition = f"Bull cash (50MA gate): SPY below MA50 for {days_below_50}d ({spy_val:.2f} < {spy_ma50_val:.2f})"
             if chop is not None:
                 next_hold, condition, chop_override = apply_chop(next_hold, condition, chop, config.safe_asset)
     else:

@@ -237,7 +237,6 @@ elif page == "Hold'em":
             banner(f"Hold {signal.next_hold}", signal.key_condition, tone=holding_tone(signal.next_hold), label=state)
             facts = [
                 ("Regime", f"{'Bull' if signal.is_bull else 'Bear'} · SPY {signal.spy_price:,.2f} vs MA100 {signal.spy_ma100:,.2f}"),
-                ("Cash gate", f"SPY {signal.spy_price:,.2f} vs MA50 {signal.spy_ma50:,.2f}"),
                 ("Phase", f"{signal.phase} · {state}"),
             ]
             if signal.phase == 2:
@@ -264,7 +263,7 @@ elif page == "Hold'em":
 
         with st.expander("Indicator details"):
             rows([
-                ("SPY MA100 / MA50", f"{signal.spy_ma100:.2f} / {signal.spy_ma50:.2f}"),
+                ("SPY MA100 / MA200", f"{signal.spy_ma100:.2f} / {signal.spy_ma200:.2f}"),
                 ("TQQQ MA20", f"{signal.tqqq_ma20:.2f}"),
                 ("RSI SQQQ / TLT", f"{signal.rsi_sqqq:.1f} / {signal.rsi_tlt:.1f}"),
             ])
@@ -273,18 +272,10 @@ elif page == "Hold'em":
             bull_overbought = signal.rsi_tqqq > 79 or signal.rsi_upro > 79
             tqqq_below_ma20 = signal.tqqq_ma20 > 0 and signal.tqqq_price < signal.tqqq_ma20
             sqqq_gt_tlt = signal.rsi_sqqq > signal.rsi_tlt
-            spy_above_ma50 = signal.spy_ma50 > 0 and signal.spy_price > signal.spy_ma50
-            is_cash_gate = signal.next_hold == "SGOV" and signal.is_bull and signal.phase == 0 and not signal.chop_override
 
             st.markdown("**Live Path Check**")
             if signal.is_bull:
                 st.markdown("- {} SPY > MA100".format("OK" if signal.is_bull else "NO"))
-                if is_cash_gate:
-                    st.markdown("- NO SPY < MA50 for 2+ days -> SGOV cash gate")
-                elif not spy_above_ma50:
-                    st.markdown("- WARN SPY < MA50 for 1 day -> await confirmation")
-                else:
-                    st.markdown("- OK SPY > MA50 -> TQQQ")
                 if signal.chop_override:
                     st.markdown(f"- CHOP QQQ vol20 {signal.qqq_vol20:.1%} -> {signal.next_hold} (RSI(2) leg {'active' if signal.rsi2_leg else 'inactive'})")
                 st.markdown(f"- {'OK' if signal.phase == 1 else 'NO'} Phase 1 UVXY hedge")
@@ -311,12 +302,10 @@ digraph HoldemTree {{
     overbought [label="Overbought?\\nTQQQ or UPRO RSI > 79"];
     cooldown [label="Cooldown complete?"];
     uvxy [label="Enter UVXY"];
-    gate [label="SPY < MA50\\n2 days?"];
     chop [label="Chop mode?\\nQQQ vol20 >25% on, <20% off"];
     leg [label="RSI(2) leg active?\\nQQQ RSI2 < 15 & > 200SMA"];
     chop_cash [label="Cash (SGOV)\\nchop mode"];
     tqqq [label="TQQQ (3x)"];
-    cash_gate [label="Cash (SGOV)\\n50MA gate"];
     bear_rsi_tqqq [label="TQQQ RSI < 30?"];
     bear_rsi_spy [label="SPY RSI < 31?"];
     bear_ma20 [label="TQQQ < MA20?"];
@@ -334,13 +323,11 @@ digraph HoldemTree {{
     p2 -> overbought [label="No"];
     p2 -> p2 [label="Yes"];
     overbought -> cooldown [label="Yes"];
-    overbought -> gate [label="No"];
-    gate -> chop [label="No (<2d below)"];
+    overbought -> chop [label="No"];
     chop -> tqqq [label="No"];
     chop -> leg [label="Yes"];
     leg -> tqqq [label="Yes"];
     leg -> chop_cash [label="No"];
-    gate -> cash_gate [label="Yes (2d+ below)"];
     cooldown -> uvxy [label="Yes"];
     cooldown -> p2 [label="No"];
     bear_rsi_tqqq -> tqqq_bear [label="Yes"];
