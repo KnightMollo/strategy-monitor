@@ -26,7 +26,7 @@ class HoldemSignal:
     uvxy_lock_until: str = ""
     cooldown_remaining: int = 0
     spy_price: float = 0.0
-    spy_ma100: float = 0.0
+    spy_regime_ma: float = 0.0
     spy_ma200: float = 0.0
     spy_ma50: float = 0.0
     tqqq_price: float = 0.0
@@ -58,6 +58,8 @@ class HoldemConfig:
     chop_mode: bool = True
     # SPY 50MA cash gate, removed 2026-10-29 (Report/gate_study); True restores the old rule.
     cash_gate: bool = False
+    # Bull/bear line: SPY vs this SMA. 200 since 2026-10-29 (Report/ashare_ideas_study regime grid); was 100.
+    regime_ma: int = 200
 
 
 def last_completed_session(now=None) -> pd.Timestamp:
@@ -70,12 +72,12 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
     """Compute the current Hold'em signal using live market data.
 
      Decision tree:
-     ┌─ SPY > MA100? (Bull market)
+     ┌─ SPY > regime SMA (default 200)? (Bull market)
      │  ├─ Phase 0: Hold TQQQ (50MA cash gate removed 2026-10-29)
      │  │    └─ Chop mode (QQQ vol20 >25% on, <20% off): TQQQ only during RSI(2) leg, else SGOV
      │  ├─ Phase 1: Hold UVXY (max 5 days)
      │  └─ Phase 2: Hold SGOV cooldown
-     └─ SPY ≤ MA100 (Bear market)
+     └─ SPY ≤ regime SMA (Bear market)
          ├─ Rebound checks: RSI(TQQQ)/RSI(SPY)
          ├─ Defense switch: SQQQ vs TLT by relative RSI
          └─ Bear default: TQQQ
@@ -116,7 +118,7 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
             close[t] = price_data[t]["Close"].reindex(common_idx)
 
     # Compute indicators
-    ma100_spy = compute_sma(close["SPY"], 100)
+    ma100_spy = compute_sma(close["SPY"], config.regime_ma)
     ma200_spy = compute_sma(close["SPY"], 200)
     ma50_spy = compute_sma(close["SPY"], 50)
     ma20_tqqq = compute_sma(close["TQQQ"], 20)
@@ -228,7 +230,7 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
     # Determine next hold
     if not np.isfinite(spy_ma_val):
         next_hold = config.safe_asset
-        condition = "MA100 data insufficient, holding SGOV."
+        condition = f"MA{config.regime_ma} data insufficient, holding SGOV."
     elif is_bull:
         if phase == 1:
             next_hold = "UVXY"
@@ -248,7 +250,7 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
                 condition = f"Cooldown complete. Waiting for RSI > {config.rsi_overbought} to re-enter UVXY or TQQQ < {tqqq_retrace:.2f}"
         else:
             next_hold = "TQQQ"
-            condition = f"Bull TQQQ: SPY {spy_val:.2f} > MA100 {spy_ma_val:.2f}"
+            condition = f"Bull TQQQ: SPY {spy_val:.2f} > MA{config.regime_ma} {spy_ma_val:.2f}"
             spy_ma50_val = float(ma50_spy.iloc[i]) if pd.notna(ma50_spy.iloc[i]) else np.nan
             if config.cash_gate and np.isfinite(spy_ma50_val):
                 # Legacy: 2 consecutive closes below MA50 -> cash, 1 close above -> TQQQ
@@ -301,7 +303,7 @@ def compute_holdem_signal(config: HoldemConfig = None, now=None) -> HoldemSignal
         uvxy_lock_until=uvxy_lock_until,
         cooldown_remaining=cooldown_remaining,
         spy_price=spy_val,
-        spy_ma100=spy_ma_val if np.isfinite(spy_ma_val) else 0,
+        spy_regime_ma=spy_ma_val if np.isfinite(spy_ma_val) else 0,
         spy_ma200=float(ma200_spy.iloc[i]) if pd.notna(ma200_spy.iloc[i]) else 0,
         spy_ma50=float(ma50_spy.iloc[i]) if pd.notna(ma50_spy.iloc[i]) else 0,
         tqqq_price=tqqq_val,

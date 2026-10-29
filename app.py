@@ -229,14 +229,16 @@ if page == "Overview":
 elif page == "Hold'em":
     page_header("Hold'em", "SPY regime state machine · TQQQ / UVXY / SGOV rotation")
     try:
-        signal = compute_holdem_signal(HoldemConfig())
+        holdem_config = HoldemConfig()
+        regime = f"MA{holdem_config.regime_ma}"
+        signal = compute_holdem_signal(holdem_config)
         state = holdem_state_label(signal)
         color = STRATEGY_COLORS["Hold'em"]
         left, right = st.columns([3, 2], gap="medium")
         with left, card("Next session", color, f"Signal from {signal.signal_date} close · executes at next open"):
             banner(f"Hold {signal.next_hold}", signal.key_condition, tone=holding_tone(signal.next_hold), label=state)
             facts = [
-                ("Regime", f"{'Bull' if signal.is_bull else 'Bear'} · SPY {signal.spy_price:,.2f} vs MA100 {signal.spy_ma100:,.2f}"),
+                ("Regime", f"{'Bull' if signal.is_bull else 'Bear'} · SPY {signal.spy_price:,.2f} vs {regime} {signal.spy_regime_ma:,.2f}"),
                 ("Phase", f"{signal.phase} · {state}"),
             ]
             if signal.phase == 2:
@@ -263,7 +265,7 @@ elif page == "Hold'em":
 
         with st.expander("Indicator details"):
             rows([
-                ("SPY MA100 / MA200", f"{signal.spy_ma100:.2f} / {signal.spy_ma200:.2f}"),
+                ("SPY regime / MA50", f"{regime} {signal.spy_regime_ma:.2f} / MA50 {signal.spy_ma50:.2f}"),
                 ("TQQQ MA20", f"{signal.tqqq_ma20:.2f}"),
                 ("RSI SQQQ / TLT", f"{signal.rsi_sqqq:.1f} / {signal.rsi_tlt:.1f}"),
             ])
@@ -275,14 +277,14 @@ elif page == "Hold'em":
 
             st.markdown("**Live Path Check**")
             if signal.is_bull:
-                st.markdown("- {} SPY > MA100".format("OK" if signal.is_bull else "NO"))
+                st.markdown("- {} SPY > {}".format("OK" if signal.is_bull else "NO", regime))
                 if signal.chop_override:
                     st.markdown(f"- CHOP QQQ vol20 {signal.qqq_vol20:.1%} -> {signal.next_hold} (RSI(2) leg {'active' if signal.rsi2_leg else 'inactive'})")
                 st.markdown(f"- {'OK' if signal.phase == 1 else 'NO'} Phase 1 UVXY hedge")
                 st.markdown(f"- {'OK' if signal.phase == 2 else 'NO'} Phase 2 SGOV cooldown")
                 st.markdown(f"- {'OK' if bull_overbought else 'NO'} RSI overbought trigger (>79)")
             else:
-                st.markdown("- OK SPY <= MA100")
+                st.markdown(f"- OK SPY <= {regime}")
                 st.markdown(f"- {'OK' if signal.rsi_tqqq < 30 else 'NO'} TQQQ RSI < 30")
                 st.markdown(f"- {'OK' if signal.rsi_spy < 31 else 'NO'} SPY RSI < 31")
                 st.markdown(f"- {'OK' if tqqq_below_ma20 else 'NO'} TQQQ < MA20")
@@ -296,7 +298,7 @@ digraph HoldemTree {{
     edge [color="#64748b", fontname="Arial", fontsize=9];
 
     start [label="Start", fillcolor="#e2e8f0"];
-    bull [label="SPY > MA100?", fillcolor="#dbeafe", color="#2563eb"];
+    bull [label="SPY > {regime}?", fillcolor="#dbeafe", color="#2563eb"];
     p1 [label="Phase 1\\nHold UVXY\\nExit: RSI < 75 or 5d cap"];
     p2 [label="Phase 2\\nHold SGOV\\nCooldown 10d\\nEarly exit: pullback 2% + TQQQ > MA20"];
     overbought [label="Overbought?\\nTQQQ or UPRO RSI > 79"];
