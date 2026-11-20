@@ -160,6 +160,27 @@ hr { border-color: __LINE__ !important; margin: 1.75rem 0 !important; }
 .aa-table tr.aa-total td { border-top: 1px solid __INK__ !important; border-bottom: none !important; font-weight: 600; }
 .aa-name { display: inline-flex; align-items: center; gap: 0.45rem; }
 .aa-up { color: __UP__; } .aa-down { color: __DOWN__; }
+
+.aa-quote { border-left: 3px solid __INK__; padding: 6px 0 6px 16px; margin: -0.25rem 0 1.25rem 0; }
+.aa-quote-text { font-family: __SERIF__; font-size: 1.2rem; line-height: 1.4; color: __INK__; }
+.aa-quote-by { color: __MUTED__; font-size: 0.82rem; margin-top: 0.3rem; }
+.aa-quote-note { color: __FAINT__; font-size: 0.8rem; margin-top: 0.15rem; }
+
+.aa-goals { border: 1px solid __LINE__; border-radius: 8px; padding: 12px 16px; background: #FFFFFF; margin: 0 0 0.75rem 0; }
+.aa-goals-head { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; align-items: baseline; }
+.aa-goals-title { color: __MUTED__; font-size: 0.78rem; }
+.aa-goals-next { color: __UP__; font-size: 0.86rem; font-weight: 500; }
+.aa-goals ul { list-style: none; margin: 0.5rem 0 0 0; padding: 0; }
+.aa-goals li { display: grid; grid-template-columns: 4.5rem minmax(0, 1fr) 11rem; align-items: center; gap: 12px;
+    padding: 5px 0; font-size: 0.88rem; font-variant-numeric: tabular-nums; }
+.aa-goal-name { font-weight: 600; color: __INK__; }
+.aa-goal-name::before { content: "•"; color: __FAINT__; margin-right: 0.45rem; font-weight: 400; }
+.aa-goal-bar { height: 8px; border-radius: 9999px; background: __SOFT__; overflow: hidden; }
+.aa-goal-fill { height: 100%; border-radius: 9999px; background: __INK__; }
+.aa-goals li.next .aa-goal-fill { background: __UP__; }
+.aa-goals li.done .aa-goal-fill { background: __UP__; opacity: 0.45; }
+.aa-goal-gap { color: __MUTED__; text-align: right; white-space: nowrap; }
+.aa-goals li.done .aa-goal-gap { color: __UP__; }
 </style>
 """
 
@@ -243,6 +264,35 @@ def banner(headline: str, detail: str | None = None, *, tone: str = "hold", labe
     body = f'<div class="aa-banner-detail">{esc(detail)}</div>' if detail else ""
     _html(f'<div class="aa-banner" style="--aa-tone:{color};--aa-tint:{tint}">'
           f'<div class="aa-banner-top">{badge}<span class="aa-banner-head">{esc(headline)}</span></div>{body}</div>')
+
+
+def quote(text: str, author: str, note: str | None = None) -> None:
+    """Serif pull quote with attribution and an optional muted note."""
+    extra = f'<div class="aa-quote-note">{esc(note)}</div>' if note else ""
+    _html(f'<div class="aa-quote"><div class="aa-quote-text">“{esc(text)}”</div>'
+          f'<div class="aa-quote-by">— {esc(author)}</div>{extra}</div>')
+
+
+def goals(current: float, targets: Sequence[float]) -> None:
+    """Bullet list of ascending goals with progress bars; the first unreached goal is highlighted."""
+    targets = sorted(targets)
+    upcoming = [t for t in targets if t > current]
+    if upcoming:
+        gap = upcoming[0] - current
+        head = f"Next ${upcoming[0] / 1000:,.0f}k: +{gap / current:.1%} to go"
+    else:
+        head = "All goals reached"
+    items = []
+    for target in targets:
+        gap = target - current
+        state = "done" if gap <= 0 else ("next" if upcoming and target == upcoming[0] else "")
+        detail = ("✓ reached" if gap <= 0
+                  else f"{current / target:.0%} · −${gap / 1000:,.1f}k · +{gap / current:.1%}")
+        items.append(f'<li class="{state}"><span class="aa-goal-name">${target / 1000:,.0f}k</span>'
+                     f'<div class="aa-goal-bar"><div class="aa-goal-fill" style="width:{min(current / target, 1):.1%}"></div></div>'
+                     f'<span class="aa-goal-gap">{esc(detail)}</span></li>')
+    _html(f'<div class="aa-goals"><div class="aa-goals-head"><span class="aa-goals-title">Goals</span>'
+          f'<span class="aa-goals-next">{esc(head)}</span></div><ul>{"".join(items)}</ul></div>')
 
 
 def rows(pairs: Iterable[Sequence[Any]]) -> None:

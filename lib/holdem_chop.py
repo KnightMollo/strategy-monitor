@@ -2,7 +2,7 @@
 
 In the bull TQQQ branch, a high-volatility QQQ regime replaces continuous TQQQ with the
 TMT RSI(2) dip-buy leg (TQQQ while the leg is active, otherwise the safe asset).
-Research: Report/rescue_study.py, Good to learn/strategies/HOLDEM_TMT_救援研究.md.
+Research: Research/holdem_tmt/studies/2026-10-22_救援研究/ (README.md, tables.md).
 """
 from __future__ import annotations
 

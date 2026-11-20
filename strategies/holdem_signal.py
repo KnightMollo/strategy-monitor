@@ -56,9 +56,9 @@ class HoldemConfig:
     pullback_pct: float = 0.02
     max_uvxy_days: int = 5
     chop_mode: bool = True
-    # SPY 50MA cash gate, removed 2026-10-29 (Report/gate_study); True restores the old rule.
+    # SPY 50MA cash gate, removed 2026-10-29 (Research/holdem_tmt/studies/2026-10-29_现金闸门); True restores the old rule.
     cash_gate: bool = False
-    # Bull/bear line: SPY vs this SMA. 200 since 2026-10-29 (Report/ashare_ideas_study regime grid); was 100.
+    # Bull/bear line: SPY vs this SMA. 200 since 2026-10-29 (Research/holdem_tmt/studies/2026-10-29_A股思路移植与牛熊均线); was 100.
     regime_ma: int = 200
 
 
